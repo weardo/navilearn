@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     chroma_dir: str = ".chroma"
 
+    # Swappable data layer. "sqlite" (default, stdlib) or "supabase" (Postgres).
+    db_backend: str = "sqlite"
+    sqlite_path: str = "navilearn.db"
+    supabase_url: str = ""
+    supabase_service_role_key: str = ""
+    supabase_anon_key: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:
