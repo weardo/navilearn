@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     groq_model: str = "llama-3.1-8b-instant"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    sarvam_api_key: str = ""
+    # Comma-separated LiteLLM model strings used as offline/backup fallbacks,
+    # e.g. "ollama/llama3.2:3b". Empty means no fallback (retries only).
+    llm_fallback_models: str = ""
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     chroma_dir: str = ".chroma"
 

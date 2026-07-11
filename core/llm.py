@@ -1,136 +1,131 @@
-"""LLM client abstraction with interchangeable providers.
+"""Unified LLM gateway: one interface, any vendor or offline model.
 
-Providers implement a single ``chat`` method returning a normalized
-``LLMResponse``. The default is local Ollama; Groq and OpenAI use the same
-OpenAI-compatible chat-completions shape; ``MockClient`` is deterministic and
-network-free for tests and evaluation harness wiring.
+Built on LiteLLM so a feature never binds to a vendor. The provider and model come
+from Settings, so the SAME code runs against Groq, OpenAI, Sarvam (Indic), or a
+fully offline Ollama model by changing one env var. Adds automatic retries and
+optional cross-provider fallbacks (e.g. hosted primary, offline backup) for
+production resilience. MockClient stays network-free and deterministic for tests.
+
+Every feature imports get_llm(settings) and calls .chat(messages) -> LLMResponse.
+The gateway is the single AI entry point (the moat), so swapping vendors or going
+offline is a config change, not a code change.
 """
-
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-import httpx
+import litellm
+from litellm import completion
 
 from core.config import Settings
+
+# Keep LiteLLM quiet and portable: drop params a given provider does not support
+# instead of erroring, and do not phone home.
+litellm.drop_params = True
+litellm.telemetry = False
+litellm.suppress_debug_info = True
 
 # Marker embedded in judge prompts so the deterministic MockClient can recognise
 # an evaluation request and return a valid JSON verdict without any network.
 JUDGE_MARKER = "JUDGE_JSON"
 
-_HTTP_TIMEOUT = 120.0
+_TIMEOUT = 120.0
+_RETRIES = 2
 
 
 @dataclass
 class LLMResponse:
-    """Normalized result of a single chat completion."""
+    """Normalized result of a single chat completion, provider-independent."""
 
     text: str
     prompt_tokens: int
     completion_tokens: int
     latency_ms: float
+    model: str = ""
 
 
 @runtime_checkable
 class LLMClient(Protocol):
-    """Protocol every provider client satisfies."""
+    """Protocol every client satisfies (gateway or mock)."""
 
     def chat(self, messages: list[dict], **opts: Any) -> LLMResponse:
-        """Return a completion for the given chat messages."""
         ...
 
 
 def _word_count(text: str) -> int:
-    return len(text.split())
+    return len(str(text).split())
 
 
 def _messages_word_count(messages: list[dict]) -> int:
-    return sum(_word_count(str(m.get("content", ""))) for m in messages)
+    return sum(_word_count(m.get("content", "")) for m in messages)
 
 
-class OllamaClient:
-    """Local Ollama provider (POST /api/chat, non-streaming)."""
+def _provider_kwargs(settings: Settings) -> tuple[str, dict[str, Any]]:
+    """Map the configured provider to a LiteLLM model string + call kwargs.
+
+    LiteLLM model strings are "<provider>/<model>". Any hosted vendor with an
+    OpenAI-compatible endpoint (Sarvam included) is reached via api_base + api_key.
+    """
+    provider = settings.llm_provider.lower()
+    if provider == "groq":
+        return f"groq/{settings.groq_model}", {"api_key": settings.groq_api_key}
+    if provider == "openai":
+        return f"openai/{settings.openai_model}", {"api_key": settings.openai_api_key}
+    if provider == "ollama":
+        return f"ollama/{settings.llm_model}", {"api_base": settings.ollama_base_url}
+    if provider == "sarvam":
+        # Sarvam exposes an OpenAI-compatible chat endpoint; reach it as a custom
+        # openai provider so the Indic model swaps in with no code change.
+        return f"openai/{settings.llm_model}", {
+            "api_key": settings.sarvam_api_key,
+            "api_base": "https://api.sarvam.ai/v1",
+        }
+    raise ValueError(f"Unknown llm_provider: {settings.llm_provider!r}")
+
+
+class LiteLLMGateway:
+    """Vendor-agnostic chat client. Same call shape for every provider."""
 
     def __init__(self, settings: Settings) -> None:
-        self._base_url = settings.ollama_base_url.rstrip("/")
-        self._model = settings.llm_model
+        self._model, self._kwargs = _provider_kwargs(settings)
+        # Optional cross-provider fallbacks, e.g. "ollama/llama3.2:3b" as an offline
+        # backup when a hosted provider is unreachable. Comma-separated in config.
+        self._fallbacks = [
+            m.strip() for m in settings.llm_fallback_models.split(",") if m.strip()
+        ]
 
     def chat(self, messages: list[dict], **opts: Any) -> LLMResponse:
         start = time.perf_counter()
-        payload = {"model": self._model, "messages": messages, "stream": False}
-        with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
-            resp = client.post(f"{self._base_url}/api/chat", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        call: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "timeout": _TIMEOUT,
+            "num_retries": _RETRIES,
+            **self._kwargs,
+            **opts,
+        }
+        if self._fallbacks:
+            call["fallbacks"] = self._fallbacks
+        resp = completion(**call)
         latency_ms = (time.perf_counter() - start) * 1000.0
-        text = data.get("message", {}).get("content", "")
-        prompt_tokens = int(
-            data.get("prompt_eval_count", _messages_word_count(messages))
-        )
-        completion_tokens = int(data.get("eval_count", _word_count(text)))
-        return LLMResponse(text, prompt_tokens, completion_tokens, latency_ms)
 
-
-class _OpenAICompatClient:
-    """Shared implementation for OpenAI-compatible chat-completions APIs."""
-
-    def __init__(self, base_url: str, api_key: str, model: str) -> None:
-        self._base_url = base_url.rstrip("/")
-        self._api_key = api_key
-        self._model = model
-
-    def chat(self, messages: list[dict], **opts: Any) -> LLMResponse:
-        start = time.perf_counter()
-        headers = {"Authorization": f"Bearer {self._api_key}"}
-        payload: dict[str, Any] = {"model": self._model, "messages": messages}
-        payload.update(opts)
-        with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
-            resp = client.post(
-                f"{self._base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        latency_ms = (time.perf_counter() - start) * 1000.0
-        text = data["choices"][0]["message"]["content"]
-        usage = data.get("usage", {})
-        prompt_tokens = int(usage.get("prompt_tokens", _messages_word_count(messages)))
-        completion_tokens = int(usage.get("completion_tokens", _word_count(text)))
-        return LLMResponse(text, prompt_tokens, completion_tokens, latency_ms)
-
-
-class GroqClient(_OpenAICompatClient):
-    """Groq provider (OpenAI-compatible, hosted, free tier)."""
-
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=settings.groq_api_key,
-            model=settings.groq_model,
-        )
-
-
-class OpenAIClient(_OpenAICompatClient):
-    """OpenAI provider (chat completions)."""
-
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(
-            base_url="https://api.openai.com/v1",
-            api_key=settings.openai_api_key,
-            model=settings.openai_model,
+        text = resp.choices[0].message.content or ""
+        usage = getattr(resp, "usage", None)
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or _messages_word_count(messages))
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or _word_count(text))
+        return LLMResponse(
+            text=text.strip(),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            latency_ms=latency_ms,
+            model=getattr(resp, "model", self._model),
         )
 
 
 class MockClient:
-    """Deterministic, network-free client for tests and eval wiring.
-
-    If any message content contains the JUDGE marker it returns a perfect-score
-    JSON verdict. Otherwise it echoes the last user question in a short canned
-    answer. Token counts are word counts; latency is a small constant.
-    """
+    """Deterministic, network-free client for tests and eval wiring."""
 
     _LATENCY_MS = 1.0
 
@@ -138,36 +133,18 @@ class MockClient:
         joined = "\n".join(str(m.get("content", "")) for m in messages)
         if JUDGE_MARKER in joined:
             text = '{"correctness": 1.0, "groundedness": 1.0, "relevance": 1.0}'
-            return LLMResponse(
-                text,
-                _messages_word_count(messages),
-                _word_count(text),
-                self._LATENCY_MS,
-            )
+            return LLMResponse(text, _messages_word_count(messages), _word_count(text), self._LATENCY_MS, "mock")
         last_user = ""
         for message in reversed(messages):
             if message.get("role") == "user":
                 last_user = str(message.get("content", ""))
                 break
         text = f"Based on the provided context, here is a simple answer to: {last_user}"
-        return LLMResponse(
-            text,
-            _messages_word_count(messages),
-            _word_count(text),
-            self._LATENCY_MS,
-        )
+        return LLMResponse(text, _messages_word_count(messages), _word_count(text), self._LATENCY_MS, "mock")
 
 
 def get_llm(settings: Settings) -> LLMClient:
-    """Select and construct the LLM client for the configured provider."""
-
-    provider = settings.llm_provider.lower()
-    if provider == "ollama":
-        return OllamaClient(settings)
-    if provider == "groq":
-        return GroqClient(settings)
-    if provider == "openai":
-        return OpenAIClient(settings)
-    if provider == "mock":
+    """Return the LLM client for the configured provider (mock stays offline)."""
+    if settings.llm_provider.lower() == "mock":
         return MockClient()
-    raise ValueError(f"Unknown llm_provider: {settings.llm_provider!r}")
+    return LiteLLMGateway(settings)
