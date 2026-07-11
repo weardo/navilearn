@@ -139,9 +139,17 @@ def extract_text(source: str) -> tuple[str, str]:
     if lowered.endswith((".srt", ".vtt")):
         return _extract_subtitles(source)
 
+    # Any video or audio file from any source: real speech-to-text on the audio,
+    # not a transcript shortcut. Lazy import so ffmpeg/STT load only when needed.
+    from core.stt import is_media, transcribe
+
+    if is_media(source):
+        text = transcribe(source)
+        return text, source.rsplit("/", 1)[-1]
+
     raise ValueError(
         f"Unsupported source: {source!r}. Supported: .pdf, .docx, .txt, .md, "
-        ".srt, .vtt files or a YouTube URL."
+        ".srt, .vtt, common video/audio files, or a YouTube URL."
     )
 
 

@@ -20,7 +20,11 @@ from core.embeddings import get_embedder
 from core.pipeline import ProcessResult, get_store, process
 from core.store import TopicStore
 
-_SUPPORTED_TYPES = ["pdf", "docx", "txt", "md", "srt", "vtt"]
+_SUPPORTED_TYPES = [
+    "pdf", "docx", "txt", "md", "srt", "vtt",
+    # Video/audio from any source: transcribed via the shared STT pipeline.
+    "mp4", "mkv", "webm", "mov", "m4v", "mp3", "wav", "m4a", "ogg", "flac",
+]
 
 
 def _active_provider() -> str:
@@ -270,7 +274,7 @@ def main() -> None:
     uploaded = st.file_uploader(
         "Upload a file",
         type=_SUPPORTED_TYPES,
-        help="Supported: PDF, DOCX, TXT, MD, SRT, VTT.",
+        help="Documents (PDF, DOCX, TXT, MD), transcripts (SRT, VTT), or any video/audio (transcribed via STT).",
     )
     youtube_url = st.text_input(
         "or a YouTube URL", placeholder="https://www.youtube.com/watch?v=..."
