@@ -125,28 +125,40 @@ def _render_interview_reports(reports: list[InterviewReport]) -> None:
                 st.write(report.feedback)
 
 
-def _render_notes_history(student_id: str) -> None:
-    """Render the mentor-note history for a student, newest first."""
+def _render_notes_thread(student_id: str) -> None:
+    """Render the two-way feedback thread for a student, oldest first.
+
+    Messages are shown as a conversation: mentor (or teacher) messages sit on
+    one side and the student's replies on the other, each labelled with its
+    author. Reads flow through :func:`core.mentoring.list_notes`, which returns
+    the thread oldest-first with an ``author_role`` per message.
+    """
 
     notes = mentoring.list_notes(student_id)
-    st.markdown("**Feedback history**")
+    st.markdown("**Feedback conversation**")
     if not notes:
-        st.caption("No feedback left yet. Be the first to write a note.")
+        st.caption("No messages yet. Send the first note below.")
         return
     for note in notes:
+        role = (note.get("author_role") or "mentor").strip() or "mentor"
+        is_student = role == "student"
+        avatar = "🎓" if is_student else "🧑‍🏫"
+        chat_role = "user" if is_student else "assistant"
+        author = note.get("author_name") or ("Student" if is_student else "Mentor")
         stamp = (note.get("created_at") or "")[:16].replace("T", " ")
-        author = note.get("mentor_name") or "Mentor"
         meta = f"{author} · {stamp}" if stamp else author
-        st.markdown(f"> {note.get('text', '')}  \n  _{meta}_")
+        with st.chat_message(chat_role, avatar=avatar):
+            st.markdown(note.get("text", ""))
+            st.caption(meta)
 
 
 def _render_feedback_form(mentor: Profile, student: Profile) -> None:
-    """Render the write-feedback form and persist a note on submit."""
+    """Render the mentor's send box and persist a thread message on submit."""
 
     form_key = f"note-form-{student.id}"
     with st.form(form_key, clear_on_submit=True):
         text = st.text_area(
-            "Write feedback for this student",
+            "Reply to this student",
             key=f"note-text-{student.id}",
             placeholder="Share encouragement, next steps, or specific pointers.",
             height=100,
@@ -154,7 +166,7 @@ def _render_feedback_form(mentor: Profile, student: Profile) -> None:
         submitted = st.form_submit_button("Send feedback")
     if submitted:
         mentor_name = (mentor.full_name or "").strip() or mentor.email or "Mentor"
-        ok = mentoring.save_note(student.id, mentor.id, mentor_name, text)
+        ok = mentoring.save_note(student.id, mentor.id, mentor_name, text, "mentor")
         if ok:
             st.success("Feedback sent.")
             st.rerun()
@@ -184,8 +196,8 @@ def _render_student_detail(repo, mentor: Profile, student: Profile) -> None:
             st.caption("Interview reports are unavailable right now.")
 
     st.divider()
+    _render_notes_thread(student.id)
     _render_feedback_form(mentor, student)
-    _render_notes_history(student.id)
 
 
 def _render_students_master_detail(

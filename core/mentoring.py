@@ -240,40 +240,61 @@ def assign_mentor(student_id: str, mentor_id: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Mentor notes (written feedback per student)
 # --------------------------------------------------------------------------- #
-def save_note(student_id: str, mentor_id: str, mentor_name: str, text: str) -> bool:
-    """Insert a mentor note for a student (best-effort). Returns success.
+def save_note(
+    student_id: str,
+    author_id: str,
+    author_name: str,
+    text: str,
+    author_role: str = "mentor",
+) -> bool:
+    """Insert one message into a student's feedback thread (best-effort).
 
-    Empty ``text`` is rejected and returns ``False`` without touching the
-    backend. The ``mentor_name`` is snapshotted onto the row so the history
-    reads well even if the profile changes later. The ``student_id`` is stored
-    in its canonical form (see :func:`_canonical_id`) so the student, who reads
-    with the uuid their runtime :class:`Profile` carries, finds the note even
-    when the mentor keyed it by a readable id. ``mentor_id`` is snapshotted as
-    passed (it is display metadata, never a read key).
+    The thread is two-way: a mentor (or teacher) and the student both post into
+    the same per-student conversation, distinguished by ``author_role``. Empty
+    ``text`` is rejected and returns ``False`` without touching the backend.
+
+    The ``author_id``, ``author_name`` and ``author_role`` describe whoever
+    wrote this message and are snapshotted onto the row so the thread reads well
+    even if the profile changes later. For backward compatibility the legacy
+    ``mentor_id`` / ``mentor_name`` columns are still filled when the author is a
+    mentor or teacher (staff-authored rows), so older readers keep working.
+
+    The ``student_id`` names the thread and is stored in its canonical form (see
+    :func:`_canonical_id`) so both sides, who may key it by a readable id or the
+    uuid their runtime :class:`Profile` carries, land on the same conversation.
     """
 
     text = (text or "").strip()
     if not text:
         return False
     student_id = (student_id or "").strip()
-    mentor_id = (mentor_id or "").strip()
-    if not student_id or not mentor_id:
+    author_id = (author_id or "").strip()
+    author_role = (author_role or "mentor").strip() or "mentor"
+    if not student_id or not author_id:
         return False
     _remember_readable(student_id)
     table = _table("mentor_notes")
     if table is None:
         return False
+    display_name = (author_name or "").strip() or (
+        "Mentor" if author_role in ("mentor", "teacher") else "Student"
+    )
+    row: dict = {
+        "id": str(uuid.uuid4()),
+        "student_id": _canonical_id(student_id),
+        "author_id": author_id,
+        "author_name": display_name,
+        "author_role": author_role,
+        "text": text,
+        "created_at": _now_iso(),
+    }
+    # Backward compatibility: keep the legacy staff columns populated for
+    # mentor/teacher-authored rows so older readers still see feedback.
+    if author_role in ("mentor", "teacher"):
+        row["mentor_id"] = author_id
+        row["mentor_name"] = display_name
     try:
-        table.insert(
-            {
-                "id": str(uuid.uuid4()),
-                "student_id": _canonical_id(student_id),
-                "mentor_id": mentor_id,
-                "mentor_name": (mentor_name or "").strip() or "Mentor",
-                "text": text,
-                "created_at": _now_iso(),
-            }
-        ).execute()
+        table.insert(row).execute()
         return True
     except Exception as exc:  # noqa: BLE001 - writes degrade to no-op.
         _LOG.warning("save_note failed: %s", exc)
@@ -281,13 +302,19 @@ def save_note(student_id: str, mentor_id: str, mentor_name: str, text: str) -> b
 
 
 def list_notes(student_id: str) -> list[dict]:
-    """Return a student's mentor notes, newest first (best-effort).
+    """Return a student's feedback thread, oldest first (best-effort).
 
-    Each item is a dict with ``id``, ``mentor_name``, ``text``, and
-    ``created_at`` keys. The ``student_id`` is canonicalized (see
-    :func:`_canonical_id`) to the same form :func:`save_note` writes, so a note
-    a mentor left keyed by a readable id is found here by the student's runtime
-    uuid. Degrades to an empty list when the backend is down.
+    The thread is a two-way conversation between a mentor (or teacher) and the
+    student. Each item is a dict with ``id``, ``author_name``, ``author_role``,
+    ``text`` and ``created_at`` keys, ordered oldest-first so callers can render
+    it top-to-bottom like a chat. Legacy rows written before the two-way columns
+    existed are mentor-authored, so their ``author_name`` / ``author_role`` fall
+    back to the old ``mentor_name`` column and the ``"mentor"`` role.
+
+    The ``student_id`` is canonicalized (see :func:`_canonical_id`) to the same
+    form :func:`save_note` writes, so a message either side left keyed by a
+    readable id is found here by the other side's runtime uuid. Degrades to an
+    empty list when the backend is down.
     """
 
     student_id = (student_id or "").strip()
@@ -299,9 +326,11 @@ def list_notes(student_id: str) -> list[dict]:
         return []
     try:
         res = (
-            table.select("id, mentor_name, text, created_at")
+            table.select(
+                "id, author_name, author_role, mentor_name, text, created_at"
+            )
             .eq("student_id", _canonical_id(student_id))
-            .order("created_at", desc=True)
+            .order("created_at", desc=False)
             .execute()
         )
     except Exception as exc:  # noqa: BLE001 - reads degrade to empty.
@@ -309,10 +338,17 @@ def list_notes(student_id: str) -> list[dict]:
         return []
     notes: list[dict] = []
     for row in res.data or []:
+        role = (row.get("author_role") or "mentor").strip() or "mentor"
+        name = (row.get("author_name") or "").strip() or (
+            row.get("mentor_name") or ""
+        ).strip()
+        if not name:
+            name = "Mentor" if role in ("mentor", "teacher") else "Student"
         notes.append(
             {
                 "id": row.get("id", ""),
-                "mentor_name": row.get("mentor_name", "") or "Mentor",
+                "author_name": name,
+                "author_role": role,
                 "text": row.get("text", "") or "",
                 "created_at": row.get("created_at", "") or "",
             }

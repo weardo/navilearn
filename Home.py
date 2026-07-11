@@ -445,39 +445,74 @@ def _render_messages(user: Profile) -> None:
 
 
 def _render_mentor_feedback(user: Profile) -> None:
-    """Render the "Feedback from your mentor" card: recent written mentor notes.
+    """Render the two-way "Mentor conversation" card on the student side.
 
-    Closes the mentoring loop on the student side. Notes are read via
+    Closes the mentoring loop as a real dialogue: the student sees the full
+    thread (mentor messages and their own replies, labelled by author) and can
+    reply back to their mentor inline. Messages are read via
     :func:`core.mentoring.list_notes`, keyed by ``user.id`` (the same runtime id
     the student carries), which the mentoring layer canonicalizes to match how a
-    mentor stored them. The mentoring module is imported defensively so a
-    momentary import or backend failure logs and degrades to a caption rather
-    than crashing Home.
+    mentor stored them; a reply is saved via :func:`core.mentoring.save_note`
+    with the ``student`` author role. The mentoring module is imported
+    defensively so a momentary import or backend failure logs and degrades to a
+    caption rather than crashing Home. Sending is best-effort.
     """
 
-    st.markdown("#### Feedback from your mentor")
+    st.markdown("#### Conversation with your mentor")
     try:
-        from core.mentoring import list_notes
-
-        notes = list_notes(user.id)
+        from core.mentoring import list_notes, save_note
     except Exception as exc:  # best-effort: never crash Home over mentoring
         _LOG.warning("mentor feedback card unavailable: %s", exc)
         st.caption("Mentor feedback is momentarily unavailable. Try again shortly.")
         return
 
+    try:
+        notes = list_notes(user.id)
+    except Exception as exc:  # best-effort: never crash Home over mentoring
+        _LOG.warning("mentor feedback thread unavailable: %s", exc)
+        st.caption("Mentor feedback is momentarily unavailable. Try again shortly.")
+        notes = []
+
     if not notes:
         st.caption(
             "No mentor feedback yet. Once a mentor reviews your work, their "
-            "notes will appear here."
+            "notes will appear here and you can reply to them."
         )
-        return
+    else:
+        for note in notes:
+            role = (note.get("author_role") or "mentor").strip() or "mentor"
+            is_student = role == "student"
+            avatar = "🎓" if is_student else "🧑‍🏫"
+            chat_role = "user" if is_student else "assistant"
+            author = (note.get("author_name") or "").strip() or (
+                "You" if is_student else "Mentor"
+            )
+            text = (note.get("text") or "").strip()
+            with st.chat_message(chat_role, avatar=avatar):
+                if text:
+                    st.write(text)
+                st.caption(f"{author} · {_fmt_date(note.get('created_at', ''))}")
 
-    for note in notes[:5]:
-        mentor_name = (note.get("mentor_name") or "").strip() or "Mentor"
-        text = (note.get("text") or "").strip()
-        st.markdown(f"**{mentor_name}** · {_fmt_date(note.get('created_at', ''))}")
-        if text:
-            st.write(text)
+    with st.form("mentor-reply-form", clear_on_submit=True):
+        reply_text = st.text_area(
+            "Reply to your mentor",
+            key="mentor-reply-text",
+            placeholder="Ask a question or share how it is going.",
+            height=80,
+        )
+        submitted = st.form_submit_button("Send reply")
+    if submitted:
+        author_name = (user.full_name or "").strip() or user.email or "Student"
+        try:
+            ok = save_note(user.id, user.id, author_name, reply_text, "student")
+        except Exception as exc:  # best-effort: never crash Home over mentoring
+            _LOG.warning("mentor reply failed: %s", exc)
+            ok = False
+        if ok:
+            st.success("Reply sent.")
+            st.rerun()
+        else:
+            st.warning("Could not send your reply. Enter some text and try again.")
 
 
 def _render_recommendation(repo: Repository, user: Profile) -> None:

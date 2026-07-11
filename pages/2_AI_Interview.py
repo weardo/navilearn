@@ -70,6 +70,12 @@ _K_CV_TYPED = "ivc_typed"
 _K_CV_PASTE_SCREEN = "ivc_paste_screen"
 _K_CV_REPORT = "ivc_report"
 _K_CV_SPEAK = "ivc_speak"
+# Pre-flight setup gate: latched booleans proving the candidate shared their
+# screen and tested their mic at least once, plus a bypass flag for candidates
+# with no screen or mic who choose the typed/paste path.
+_K_CV_SCREEN_READY = "ivc_screen_ready"
+_K_CV_MIC_READY = "ivc_mic_ready"
+_K_CV_SKIP_SETUP = "ivc_skip_setup"
 
 # Language choices for the Indic-voice layer. The label is what the selector
 # shows; the value maps to the Sarvam BCP-47 code used for both TTS and STT.
@@ -735,6 +741,9 @@ def _reset_conv() -> None:
         _K_CV_AUDIO_HASH,
         _K_CV_REPORT,
         _K_CV_SPEAK,
+        _K_CV_SCREEN_READY,
+        _K_CV_MIC_READY,
+        _K_CV_SKIP_SETUP,
     ):
         st.session_state.pop(key, None)
 
@@ -923,15 +932,32 @@ def _conv_process_audio(audio, summary: str) -> None:
     _conv_advance(summary, transcript)
 
 
-def _render_conv_transcript(history: list[Turn]) -> None:
-    """Render the running question/answer transcript for the conversation."""
+def _render_conv_transcript(history: list[Turn], pending_question: str = "") -> None:
+    """Render the full running interview as a persistent chat log.
 
-    if not history:
+    Each completed turn renders the interviewer's question in an assistant chat
+    bubble followed by the candidate's answer in a user chat bubble, so the
+    conversation reads top to bottom like a real transcript. When a question is
+    awaiting an answer, ``pending_question`` is appended as a trailing assistant
+    bubble so the candidate always sees the live conversation above the answer
+    control. The log is derived from ``_K_CV_HISTORY`` plus the current question
+    in session state, so it persists across the reruns that each recording,
+    screen frame and answer trigger.
+    """
+
+    if not history and not pending_question:
         return
-    st.markdown("#### Conversation so far")
-    for index, turn in enumerate(history, start=1):
-        st.markdown(f"**Q{index}.** {turn.question}")
-        st.markdown(f"> {turn.answer.strip() if turn.answer and turn.answer.strip() else '(no answer)'}")
+    st.markdown("#### Conversation")
+    for turn in history:
+        if turn.question:
+            with st.chat_message("assistant"):
+                st.markdown(turn.question)
+        answered = turn.answer.strip() if turn.answer and turn.answer.strip() else ""
+        with st.chat_message("user"):
+            st.markdown(answered or "_(no answer)_")
+    if pending_question:
+        with st.chat_message("assistant"):
+            st.markdown(pending_question)
 
 
 def _conv_finish(user, summary: str) -> None:
@@ -955,6 +981,68 @@ def _conv_finish(user, summary: str) -> None:
         st.session_state[_K_CV_QUESTION] = ""
         _persist_report(user.id, summary, report)
         st.rerun()
+
+
+def _render_preflight_setup() -> tuple[bool, bool, bool]:
+    """Render the "Before we begin" setup gate and report its readiness.
+
+    Two checks must pass before the conversational interview can start: the
+    candidate shares their browser screen (Step 1) and records a short mic test
+    (Step 2). Each satisfied check is latched into session state, so a later
+    rerun (a fresh screen frame, a re-recorded clip) never un-readies a step that
+    already passed. A small "Skip setup" escape sets a bypass flag so a candidate
+    with no screen or mic can still proceed in typed/paste mode. Returns
+    ``(screen_ready, mic_ready, skip)``.
+
+    Every input here is a real browser widget (a shared frame, a recording), so a
+    headless AppTest run (which never shares or records) latches nothing and the
+    gate stays closed, exactly as intended.
+    """
+
+    st.markdown("#### Before we begin")
+    st.caption(
+        "Two quick checks so the live interview runs smoothly: share your screen "
+        "and test your microphone. No screen or mic? Use Skip setup to type your "
+        "answers and paste your screen instead."
+    )
+
+    # Step 1 SCREEN. A non-empty frame that is not an error sentinel proves the
+    # browser screen share works; latch it so later frames keep the step ready.
+    st.markdown("**Step 1 · Share your screen**")
+    st.caption('Click "Share my screen" below and choose a window, tab or display.')
+    frame = screen_share.screen_share_widget(interval_ms=5000, key="ivc_screen_setup")
+    if isinstance(frame, str) and frame and not frame.startswith("ERROR:"):
+        st.session_state[_K_CV_SCREEN_READY] = True
+    screen_ready = bool(st.session_state.get(_K_CV_SCREEN_READY))
+    if screen_ready:
+        st.success("Screen shared")
+    elif isinstance(frame, str) and frame.startswith("ERROR:"):
+        reason = frame[len("ERROR:"):].strip() or "declined"
+        st.caption(
+            f"Screen share unavailable ({reason}). You can paste your screen "
+            "text as a fallback once the interview starts."
+        )
+    else:
+        st.caption(
+            'Waiting for you to click "Share my screen". You can also paste your '
+            "screen text as a fallback later."
+        )
+
+    # Step 2 MIC. Any non-empty recording proves the browser mic works; latch it.
+    st.markdown("**Step 2 · Test your microphone**")
+    mic_clip = st.audio_input(
+        "Test your microphone (record a short hello)", key="ivc_mic_test"
+    )
+    if mic_clip is not None and mic_clip.getvalue():
+        st.session_state[_K_CV_MIC_READY] = True
+    mic_ready = bool(st.session_state.get(_K_CV_MIC_READY))
+    if mic_ready:
+        st.success("Microphone working")
+    else:
+        st.caption("Record a short hello to confirm your browser microphone works.")
+
+    skip = bool(st.session_state.get(_K_CV_SKIP_SETUP))
+    return screen_ready, mic_ready, skip
 
 
 def _render_conversational_interview(user) -> None:
@@ -989,11 +1077,19 @@ def _render_conversational_interview(user) -> None:
                 "for the Task model."
             ),
         )
+        # --- Pre-flight setup gate. --------------------------------------- #
+        # The candidate must share their screen and test their mic (or press
+        # Skip) before the interview can start, so the live conversation never
+        # begins on a broken screen share or a dead microphone.
+        screen_ready, mic_ready, skip = _render_preflight_setup()
+        gate_open = skip or (screen_ready and mic_ready)
+
         if st.button(
             "Start conversational interview",
             key="ivc_start",
             type="primary",
             width="stretch",
+            disabled=not gate_open,
         ):
             summary = st.session_state.get(_K_CV_SUMMARY, "")
             engine = InterviewEngine()
@@ -1009,6 +1105,26 @@ def _render_conversational_interview(user) -> None:
                 st.session_state.pop(_K_CV_REPORT, None)
                 st.session_state.pop(_K_CV_AUDIO_HASH, None)
                 st.session_state.pop(_K_CV_SCREEN_HASH, None)
+                st.rerun()
+
+        if not gate_open:
+            needs = []
+            if not screen_ready:
+                needs.append("share your screen")
+            if not mic_ready:
+                needs.append("test your microphone")
+            st.caption("Still needed before you can start: " + ", ".join(needs) + ".")
+        elif skip and not (screen_ready and mic_ready):
+            st.caption(
+                "Setup skipped: you can type your answers and paste your screen "
+                "text during the interview."
+            )
+
+        if not skip:
+            if st.button(
+                "Skip setup (type answers, paste screen)", key="ivc_skip_setup_btn"
+            ):
+                st.session_state[_K_CV_SKIP_SETUP] = True
                 st.rerun()
 
         prior = st.session_state.get(_K_CV_REPORT)
@@ -1029,24 +1145,43 @@ def _render_conversational_interview(user) -> None:
     history = _conv_history()
     has_report = isinstance(st.session_state.get(_K_CV_REPORT), RubricReport)
 
+    # Persistent running chat log, always visible ABOVE the answer control so the
+    # candidate watches the conversation grow turn by turn. The pending question
+    # is rendered as the trailing interviewer bubble, so a live interview always
+    # shows the question the candidate is answering right now.
+    _render_conv_transcript(history, pending_question=question)
+
     if question:
         turn_no = len(history) + 1
-        st.markdown(f"#### Question {turn_no} of up to {_MAX_TURNS}")
-        st.info(question)
+        st.caption(f"Question {turn_no} of up to {_MAX_TURNS}.")
+        # Speak the current question aloud once (on the render right after it is
+        # asked); the flag is set by the opening and each follow-up.
         if st.session_state.pop(_K_CV_SPEAK, False):
             _speak_autoplay(question)
 
-        st.caption(
-            "Answer out loud and the interview advances on its own when you stop, "
-            "or type your answer and press Send."
+        # Prominent voice answer control: this is the primary way to answer, and
+        # it stays visible for the whole live interview. In Streamlit, stopping
+        # the recording is the done-talking signal (true silence VAD needs
+        # streamlit-webrtc, which is not available), so a stop auto-submits.
+        st.markdown("#### Your answer")
+        st.markdown(
+            "**Allow your microphone, then speak your answer. Click stop when "
+            "done.**"
         )
-        audio = st.audio_input("Answer out loud", key=_K_CV_AUDIO)
+        st.caption(
+            "Clicking stop submits your answer: the interviewer transcribes it, "
+            "adds it to the conversation above, and asks the next question out "
+            "loud on its own. No separate submit needed."
+        )
+        audio = st.audio_input(
+            "Speak your answer, then click stop", key=_K_CV_AUDIO
+        )
         if audio is not None:
             _conv_process_audio(audio, summary)
 
         with st.form("ivc_typed_form", clear_on_submit=True):
             typed = st.text_input(
-                "Or type your answer",
+                "Prefer to type? Enter your answer and press Send",
                 key=_K_CV_TYPED,
                 placeholder="Explain the concrete choice on screen, not the textbook definition.",
             )
@@ -1058,8 +1193,6 @@ def _render_conversational_interview(user) -> None:
             "You have answered the maximum number of questions. Finish and score "
             "when you are ready."
         )
-
-    _render_conv_transcript(history)
 
     if history and not has_report:
         if st.button(
