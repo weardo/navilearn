@@ -2,6 +2,10 @@
 
 **A holistic, Indic-first learning platform where one multimodal understanding pipeline turns any input into structured, scored learning intelligence for every stakeholder.**
 
+> ### Live demo: **https://navi.soupup.ai**
+> One-click demo accounts on the sign-in page: **Sam Student**, **Maya Mentor**, **Tara Teacher**.
+> Repo: `github.com/weardo/navilearn` · API docs: `docs/API_DOCS.md` · Submission summary: `docs/SUBMISSION.md`
+
 NaviLearn is a Python (Streamlit + FastAPI) and Supabase edtech platform built for the NavGurukul-style mission of reaching underserved learners at scale. Instead of shipping a pile of disconnected tools, it stands one shared analysis pipeline in the middle: documents, PDFs, transcripts, videos, audio, YouTube links, and even a live screen plus voice are all normalized into a single `Understanding` (extracted text plus an LLM-structured concept map). Every feature is a thin consumer of that pipeline, so outputs stay consistent across the three people the platform serves: **students** who learn and get assessed, **mentors** who coach and give feedback, and **teachers** who run and analyze a cohort. Indic language support (Sarvam speech-to-text and text-to-speech) is first-class, and the whole stack is designed to run cheaply and offline-tolerantly on a laptop.
 
 ---
