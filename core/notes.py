@@ -57,6 +57,7 @@ class Note:
     is_public: bool = False
     created_at: str = ""
     updated_at: str = ""
+    shared_by: str = ""
 
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +105,13 @@ def _table():
 
     client = _client()
     return client.table("notes") if client is not None else None
+
+
+def _shares_table():
+    """Return the ``note_shares`` table handle, or ``None`` if the client is down."""
+
+    client = _client()
+    return client.table("note_shares") if client is not None else None
 
 
 def _note_from_row(row: dict[str, Any]) -> Note:
@@ -187,6 +195,100 @@ def get_public_note(note_id: str) -> Optional[Note]:
     except Exception as exc:  # noqa: BLE001 - reads degrade to None.
         _LOG.warning("get_public_note failed: %s", exc)
         return None
+
+
+def list_shared_with_me(owner_id: str) -> list[Note]:
+    """Return the notes another user has shared directly TO ``owner_id``.
+
+    This is the recipient's inbox for user-to-user shares: it reads
+    ``note_shares`` rows whose ``to_id`` equals ``owner_id`` (newest share
+    first), loads the referenced notes, and stamps each returned :class:`Note`
+    with :attr:`Note.shared_by` from the share row's ``from_name`` so the UI can
+    show who sent it. A targeted share is private to the recipient, so this does
+    NOT require ``is_public``. Best-effort: returns an empty list when the
+    backend is unavailable or a query fails.
+    """
+
+    shares = _shares_table()
+    notes = _table()
+    if shares is None or notes is None:
+        return []
+    try:
+        res = (
+            shares.select("note_id,from_name,created_at")
+            .eq("to_id", owner_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+    except Exception as exc:  # noqa: BLE001 - reads degrade to empty.
+        _LOG.warning("list_shared_with_me shares lookup failed: %s", exc)
+        return []
+
+    rows = list(res.data or [])
+    # Preserve newest-first order while de-duplicating repeated note ids.
+    order: list[str] = []
+    sharer_by_note: dict[str, str] = {}
+    for row in rows:
+        nid = str(row.get("note_id") or "")
+        if not nid:
+            continue
+        if nid not in sharer_by_note:
+            order.append(nid)
+            sharer_by_note[nid] = row.get("from_name") or ""
+
+    if not order:
+        return []
+
+    try:
+        note_res = notes.select("*").in_("id", order).execute()
+    except Exception as exc:  # noqa: BLE001 - reads degrade to empty.
+        _LOG.warning("list_shared_with_me notes lookup failed: %s", exc)
+        return []
+
+    by_id: dict[str, dict[str, Any]] = {
+        str(r.get("id") or ""): r for r in (note_res.data or [])
+    }
+    out: list[Note] = []
+    for nid in order:
+        row = by_id.get(nid)
+        if row is None:
+            continue
+        note = _note_from_row(row)
+        note.shared_by = sharer_by_note.get(nid, "")
+        out.append(note)
+    return out
+
+
+def get_shared_note(note_id: str, viewer_id: str) -> Optional[Note]:
+    """Return a note ``viewer_id`` is allowed to open, else ``None``.
+
+    A viewer may open a note when it is public (the "anyone with the link"
+    model) OR when it has been shared directly to them via ``note_shares``
+    (the targeted user-to-user model). Returns ``None`` when the note is
+    missing, the viewer has neither grant, or the backend is unavailable.
+    """
+
+    note = get_note(note_id)
+    if note is None:
+        return None
+    if note.is_public:
+        return note
+
+    shares = _shares_table()
+    if shares is None:
+        return None
+    try:
+        res = (
+            shares.select("id")
+            .eq("note_id", note_id)
+            .eq("to_id", viewer_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:  # noqa: BLE001 - reads degrade to None.
+        _LOG.warning("get_shared_note share lookup failed: %s", exc)
+        return None
+    return note if (res.data or []) else None
 
 
 # --------------------------------------------------------------------------- #
@@ -307,4 +409,37 @@ def set_public(note_id: str, public: bool) -> bool:
         return True
     except Exception as exc:  # noqa: BLE001 - writes degrade to no-op.
         _LOG.warning("set_public failed: %s", exc)
+        return False
+
+
+def share_note_with(
+    note_id: str, from_id: str, from_name: str, to_id: str
+) -> bool:
+    """Share ``note_id`` directly with ``to_id`` so it lands on their dashboard.
+
+    Upserts a ``note_shares`` row (idempotent on the ``(note_id, to_id)`` unique
+    key), recording who sent it (``from_id`` / ``from_name``) so the recipient's
+    inbox can attribute the share. This is the targeted user-to-user model and
+    does NOT flip the note public; the recipient reads it via
+    :func:`get_shared_note` / :func:`list_shared_with_me`. Best-effort: returns
+    ``False`` when the backend is down or the write fails.
+    """
+
+    table = _shares_table()
+    if table is None:
+        return False
+    try:
+        table.upsert(
+            {
+                "note_id": note_id,
+                "from_id": from_id or "",
+                "from_name": from_name or from_id or "",
+                "to_id": to_id or "",
+                "created_at": _now_iso(),
+            },
+            on_conflict="note_id,to_id",
+        ).execute()
+        return True
+    except Exception as exc:  # noqa: BLE001 - writes degrade to no-op.
+        _LOG.warning("share_note_with failed: %s", exc)
         return False

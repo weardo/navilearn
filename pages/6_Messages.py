@@ -13,10 +13,13 @@ A two-pane messaging app that sits alongside the Live Classroom:
   and grey, with a sender name in group rooms and a small timestamp), and a
   ``st.chat_input`` composer pinned to the bottom of the page.
 
-Live updates are handled by ``streamlit_autorefresh``: a "Live" toggle (default
-on) reruns the page every few seconds so a message from the other person appears
-without any manual refresh. There is no ``time.sleep`` and no websocket; the
-free-tier pattern is shared Postgres tables plus a light poll.
+Live updates are handled by Streamlit fragments: the thread transcript lives in
+an ``@st.fragment`` whose ``run_every`` is set to a few seconds while the "Live"
+toggle (default on) is enabled, so ONLY the open room's bubbles reload on the
+timer while the conversation list, composer, and creators stay interactive and do
+not flicker. Turning Live off makes the fragment static. There is no
+``time.sleep`` and no websocket; the free-tier pattern is shared Postgres tables
+plus a light per-fragment poll.
 
 The open room id lives in ``st.session_state['msg_selected_room_id']`` and
 defaults to the shared Main Room. All backend work is delegated to
@@ -53,17 +56,10 @@ _SELECTED_KEY = "msg_selected_room_id"
 # How many messages to load into the thread pane at once.
 _THREAD_LIMIT = 60
 
-# How often (ms) the "Live" poll reruns the page to pull in new messages.
-_LIVE_INTERVAL_MS = 3000
-
-# Best-effort import of the autorefresh helper. If the optional dependency is
-# missing the page still renders (Live simply becomes a no-op) instead of
-# crashing, in keeping with the side-effect policy.
-try:  # pragma: no cover - import guard, exercised implicitly.
-    from streamlit_autorefresh import st_autorefresh
-except Exception as exc:  # noqa: BLE001 - a missing helper must not break the page.
-    _LOG.warning("streamlit_autorefresh unavailable, Live disabled: %s", exc)
-    st_autorefresh = None  # type: ignore[assignment]
+# How often (seconds) the thread fragment reruns to pull new messages while Live
+# is on. The conversation-list fragment refreshes on a slower cadence.
+_LIVE_INTERVAL_S = 3.0
+_CONV_INTERVAL_S = 6.0
 
 
 # --------------------------------------------------------------------------- #
@@ -386,6 +382,40 @@ def _render_thread(user, room: Room) -> None:
     st.markdown(_bubble_html(user.id, room, messages), unsafe_allow_html=True)
 
 
+def _resolve_room(user, room_id: str) -> Room:
+    """Return the Room for ``room_id``, falling back to a bare main-room stub."""
+
+    rooms = list_rooms(user.id)
+    room = next((r for r in rooms if r.id == room_id), None)
+    if room is None:
+        room = Room(id=room_id, type="main", name="Main Room")
+    return room
+
+
+def _thread_fragment(user) -> None:
+    """Auto-refreshing thread pane.
+
+    This is the ONLY part of the page that reruns on the Live timer. It reads the
+    open room id from ``st.session_state`` on every (partial) rerun so it always
+    reflects the current conversation and pulls in new messages, while the
+    conversation list, composer, and creators are left untouched (no flicker, no
+    lost drafts). When Live is off it renders once as a static fragment.
+    """
+
+    room_id = _selected_room_id()
+    _render_thread(user, _resolve_room(user, room_id))
+
+
+def _conversations_fragment(user) -> None:
+    """Conversation list on its own slower refresh so previews stay fresh.
+
+    Runs independently of the thread fragment; a room button here calls
+    ``st.rerun`` (app scope) so opening a chat still refreshes both panes.
+    """
+
+    _render_conversations(user, _selected_room_id())
+
+
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
@@ -402,25 +432,24 @@ def main() -> None:
     with live_col:
         live = st.toggle("Live", value=True, key="msg_live")
 
-    # Live polling: rerun every few seconds so the other person's messages show
-    # up without a manual refresh. Gated behind the toggle; never blocks.
-    if live and st_autorefresh is not None:
-        st_autorefresh(interval=_LIVE_INTERVAL_MS, key="msg_autorefresh")
+    # Live updates are per-fragment, not whole-page. The Live toggle simply picks
+    # the fragments' run_every: a cadence in seconds while on, None (static) while
+    # off. Only the fragments rerun on the timer; the composer and creators do not.
+    thread_every = _LIVE_INTERVAL_S if live else None
+    conv_every = _CONV_INTERVAL_S if live else None
 
     room_id = _selected_room_id()
-    rooms = list_rooms(user.id)
-    room = next((r for r in rooms if r.id == room_id), None)
-    if room is None:
-        room = Room(id=room_id, type="main", name="Main Room")
 
     left, right = st.columns([1, 2], gap="medium")
     with left:
-        _render_conversations(user, room_id)
+        st.fragment(run_every=conv_every)(_conversations_fragment)(user)
         st.divider()
         _render_new_dm(user)
         _render_new_group(user)
     with right:
-        _render_thread(user, room)
+        # Thread transcript is the auto-refreshing fragment; the composer lives
+        # OUTSIDE it so typing and sending are never interrupted by the poll.
+        st.fragment(run_every=thread_every)(_thread_fragment)(user)
         _render_composer(user, room_id)
 
 

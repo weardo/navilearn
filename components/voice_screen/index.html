@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; color: inherit; }
+    .wrap { display: flex; flex-direction: column; gap: 8px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    button { cursor: pointer; border: 0; border-radius: 8px; padding: 8px 14px; font-size: 14px; font-weight: 600; background: #4f46e5; color: #fff; }
+    button.stop { background: #6b7280; }
+    video { width: 100%; max-height: 200px; border-radius: 10px; background: #111; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #9ca3af; transition: background .15s; }
+    .dot.listen { background: #22c55e; }
+    .dot.speech { background: #ef4444; }
+    .dot.paused { background: #f59e0b; }
+    .status { font-size: 13px; opacity: 0.9; }
+    .level { height: 6px; border-radius: 3px; background: #22c55e; width: 0%; transition: width .08s linear; }
+    .levelbar { flex: 1; height: 6px; border-radius: 3px; background: rgba(0,0,0,0.12); overflow: hidden; min-width: 80px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="row">
+      <button id="start">Enable mic and screen</button>
+      <button id="stop" class="stop" style="display:none">Stop</button>
+      <span class="dot" id="dot"></span>
+      <span class="status" id="status">Click to enable your microphone and share your screen. Then just talk.</span>
+    </div>
+    <div class="row"><div class="levelbar"><div class="level" id="level"></div></div></div>
+    <video id="screen" autoplay muted playsinline></video>
+    <canvas id="canvas" style="display:none"></canvas>
+  </div>
+
+  <script>
+    // ---- Streamlit no-build bridge ----
+    function _post(type, data) { window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*"); }
+    function ready() { _post("streamlit:componentReady", { apiVersion: 1 }); }
+    function setHeight(h) { _post("streamlit:setFrameHeight", { height: h }); }
+    function setValue(v) { _post("streamlit:setComponentValue", { value: v, dataType: "json" }); }
+
+    // ---- config (overridable via Streamlit args) ----
+    var SILENCE_MS = 1100;        // quiet time after speech that ends a turn
+    var MIN_SPEECH_MS = 350;      // ignore blips shorter than this
+    var SPEECH_RMS = 0.020;       // energy above this = speech
+    var SILENCE_RMS = 0.012;      // energy below this = silence
+
+    // ---- state ----
+    var micStream = null, screenStream = null, audioCtx = null, analyser = null, buf = null;
+    var recorder = null, chunks = [], listening = false, allowed = true, rafId = null;
+    var speaking = false, speechStart = 0, lastLoud = 0, seq = 0, cooldownUntil = 0;
+
+    var startBtn = document.getElementById("start");
+    var stopBtn = document.getElementById("stop");
+    var dot = document.getElementById("dot");
+    var statusEl = document.getElementById("status");
+    var levelEl = document.getElementById("level");
+    var video = document.getElementById("screen");
+    var canvas = document.getElementById("canvas");
+
+    function setStatus(t, cls) { statusEl.textContent = t; dot.className = "dot" + (cls ? " " + cls : ""); }
+
+    function grabScreen() {
+      if (!screenStream || !video.videoWidth) return "";
+      var scale = Math.min(1, 1000 / video.videoWidth);
+      canvas.width = Math.round(video.videoWidth * scale);
+      canvas.height = Math.round(video.videoHeight * scale);
+      canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+      try { return canvas.toDataURL("image/jpeg", 0.6); } catch (e) { return ""; }
+    }
+
+    function startRecording() {
+      chunks = [];
+      try {
+        recorder = new MediaRecorder(micStream);
+      } catch (e) { return; }
+      recorder.ondataavailable = function (ev) { if (ev.data && ev.data.size > 0) chunks.push(ev.data); };
+      recorder.onstop = function () {
+        var blob = new Blob(chunks, { type: chunks[0] ? chunks[0].type : "audio/webm" });
+        var screen = grabScreen();
+        var reader = new FileReader();
+        reader.onloadend = function () {
+          seq += 1;
+          setValue({ seq: seq, audio: reader.result || "", screen: screen });
+          setStatus("Heard you. The interviewer is thinking...", "paused");
+        };
+        reader.readAsDataURL(blob);
+      };
+      recorder.start();
+    }
+
+    function loop() {
+      rafId = requestAnimationFrame(loop);
+      if (!analyser) return;
+      analyser.getFloatTimeDomainData(buf);
+      var sum = 0;
+      for (var i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+      var rms = Math.sqrt(sum / buf.length);
+      levelEl.style.width = Math.min(100, Math.round(rms * 800)) + "%";
+
+      var now = Date.now();
+      if (!allowed || now < cooldownUntil) { setStatus("Interviewer is speaking, mic paused...", "paused"); return; }
+
+      if (!speaking) {
+        setStatus("Listening. Just start talking.", "listen");
+        if (rms > SPEECH_RMS) {
+          speaking = true; speechStart = now; lastLoud = now;
+          if (recorder && recorder.state === "recording") { } else { startRecording(); }
+        }
+      } else {
+        setStatus("Listening (you are talking)...", "speech");
+        if (rms > SILENCE_RMS) lastLoud = now;
+        if (now - lastLoud > SILENCE_MS) {
+          // end of turn
+          speaking = false;
+          if (now - speechStart > MIN_SPEECH_MS && recorder && recorder.state === "recording") {
+            recorder.stop();
+            cooldownUntil = now + 2000; // brief guard; Python re-enables via args when done speaking
+          } else if (recorder && recorder.state === "recording") {
+            recorder.stop(); chunks = []; // too short, discard
+          }
+        }
+      }
+    }
+
+    async function start() {
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+        screenStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 1 }, audio: false });
+        video.srcObject = screenStream;
+        screenStream.getVideoTracks()[0].addEventListener("ended", stop);
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        var src = audioCtx.createMediaStreamSource(micStream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 1024;
+        buf = new Float32Array(analyser.fftSize);
+        src.connect(analyser);
+        listening = true;
+        startBtn.style.display = "none";
+        stopBtn.style.display = "inline-block";
+        setStatus("Listening. Just start talking.", "listen");
+        loop();
+      } catch (e) {
+        setStatus("Could not access mic or screen: " + (e && e.message ? e.message : "denied"), "");
+        setValue({ seq: -1, audio: "", screen: "", error: (e && e.message) || "denied" });
+      }
+    }
+
+    function stop() {
+      if (rafId) cancelAnimationFrame(rafId);
+      try { if (recorder && recorder.state === "recording") recorder.stop(); } catch (e) {}
+      [micStream, screenStream].forEach(function (s) { if (s) s.getTracks().forEach(function (t) { t.stop(); }); });
+      micStream = screenStream = null; analyser = null; listening = false;
+      video.srcObject = null;
+      startBtn.style.display = "inline-block";
+      stopBtn.style.display = "none";
+      setStatus("Stopped.", "");
+    }
+
+    startBtn.onclick = start;
+    stopBtn.onclick = stop;
+
+    // Receive args from Python (allow: resume listening after the interviewer finished speaking; thresholds)
+    window.addEventListener("message", function (e) {
+      if (!e.data || e.data.type !== "streamlit:render") return;
+      var a = e.data.args || {};
+      if (typeof a.allow === "boolean") { allowed = a.allow; if (allowed) cooldownUntil = 0; }
+      if (a.silence_ms) SILENCE_MS = a.silence_ms;
+      if (a.speech_rms) SPEECH_RMS = a.speech_rms;
+      setHeight(260);
+    });
+
+    ready();
+    setHeight(260);
+  </script>
+</body>
+</html>

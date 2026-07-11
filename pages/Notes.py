@@ -9,10 +9,12 @@ A two-pane note-taking app that lives alongside the rest of NaviLearn:
   box, a Markdown body area, a tags box, a Save button (create for a new note,
   update for an existing one) and a Delete button, plus a small live Markdown
   preview of the body.
-- Share section (existing notes only): a "Share" button flips the note public and
-  builds an unlisted link of the form ``/Shared?n=<id>`` shown in a copyable code
-  block, a "Send to a person" picker that opens a direct message and posts the
-  link, and a "Make private" control that flips the note back to private.
+- Share section (existing notes only): two clearly-separated models. "Send to a
+  person" delivers the note straight to another user's dashboard (a targeted,
+  recipient-private share recorded in ``note_shares``). "Anyone with the link" is
+  the separate public model: a button flips the note public and builds an unlisted
+  ``/Shared?n=<id>`` link in a copyable code block, with a "Make private" control
+  to revoke it.
 
 The open note id lives in ``st.session_state['notes_selected_id']``; the sentinel
 :data:`_NEW` means an unsaved new note. All backend work is delegated to
@@ -27,7 +29,7 @@ from typing import Optional
 
 import streamlit as st
 
-from core.messaging import get_or_create_dm, list_directory, post_message
+from core.messaging import list_directory
 from core.notes import (
     Note,
     create_note,
@@ -35,6 +37,7 @@ from core.notes import (
     get_note,
     list_notes,
     set_public,
+    share_note_with,
     update_note,
 )
 from core.session import require_user
@@ -249,36 +252,30 @@ def _delete(note: Optional[Note]) -> None:
 # Sharing
 # --------------------------------------------------------------------------- #
 def _render_share(user, note: Note) -> None:
-    """Render the Share section: public link, send-to-person, and make private."""
+    """Render the Share section: two clearly-separated sharing models.
+
+    - **Send to a person** delivers the note directly to another user's
+      dashboard (targeted, private to the recipient). This is the default,
+      primary way to share.
+    - **Anyone with the link** is the separate public-link model: publish the
+      note and hand out an unlisted URL that any holder can open.
+    """
 
     st.markdown("#### Share")
 
-    if not note.is_public:
-        st.caption("This note is private. Publish it to create a shareable link.")
-        if st.button("Share", key=f"notes_share_{note.id}", width="stretch", type="primary"):
-            if set_public(note.id, True):
-                st.toast("Note published. Anyone with the link can now view it.")
-            else:
-                st.warning("Could not publish the note. Please try again.")
-            st.rerun()
-        return
+    _render_send_to_person(user, note)
 
-    link = _share_link(note.id)
-    st.code(link, language="text")
-    st.caption("Anyone with this link can view this note")
-
-    _render_send_to_person(user, note, link)
-
-    if st.button("Make private", key=f"notes_private_{note.id}", width="stretch"):
-        if set_public(note.id, False):
-            st.toast("Note is private again. The share link no longer works.")
-        else:
-            st.warning("Could not make the note private. Please try again.")
-        st.rerun()
+    st.divider()
+    _render_public_link(note)
 
 
-def _render_send_to_person(user, note: Note, link: str) -> None:
-    """Direct-message picker that opens a DM and posts the share link."""
+def _render_send_to_person(user, note: Note) -> None:
+    """Deliver the note straight to another user's dashboard (targeted share)."""
+
+    st.markdown("**Send to a person**")
+    st.caption(
+        "Deliver this note straight to someone's dashboard. Only they can see it."
+    )
 
     people = list_directory(user.id)
     if not people:
@@ -294,21 +291,52 @@ def _render_send_to_person(user, note: Note, link: str) -> None:
         options=[p["id"] for p in people],
         format_func=lambda pid: labels.get(pid, pid),
         key=f"notes_send_person_{note.id}",
+        label_visibility="collapsed",
     )
-    if st.button("Send link", key=f"notes_send_btn_{note.id}", width="stretch"):
+    if st.button("Send to person", key=f"notes_send_btn_{note.id}", width="stretch", type="primary"):
         other_name = choice
         for person in people:
             if person["id"] == choice:
                 other_name = person["name"]
                 break
-        room_id = get_or_create_dm(
-            user.id, user.full_name or user.id, choice, other_name
-        )
-        message = f"I shared a note with you: {note.title or 'Untitled note'} {link}"
-        if post_message(room_id, user.id, user.full_name or user.id, message):
-            st.toast(f"Link sent to {other_name}.")
+        if share_note_with(note.id, user.id, user.full_name or user.id, choice):
+            st.success(
+                f"Shared with {other_name}. It now appears on their dashboard."
+            )
         else:
-            st.warning("Could not send the link. Please try again.")
+            st.warning("Could not share the note. Please try again.")
+
+
+def _render_public_link(note: Note) -> None:
+    """Render the separate "anyone with the link" public-share model."""
+
+    st.markdown("**Anyone with the link**")
+
+    if not note.is_public:
+        st.caption(
+            "This note is private. Publish it to create an unlisted link anyone "
+            "can open."
+        )
+        if st.button(
+            "Create public link", key=f"notes_share_{note.id}", width="stretch"
+        ):
+            if set_public(note.id, True):
+                st.toast("Note published. Anyone with the link can now view it.")
+            else:
+                st.warning("Could not publish the note. Please try again.")
+            st.rerun()
+        return
+
+    link = _share_link(note.id)
+    st.code(link, language="text")
+    st.caption("Anyone with this link can view this note.")
+
+    if st.button("Make private", key=f"notes_private_{note.id}", width="stretch"):
+        if set_public(note.id, False):
+            st.toast("Note is private again. The share link no longer works.")
+        else:
+            st.warning("Could not make the note private. Please try again.")
+        st.rerun()
 
 
 # --------------------------------------------------------------------------- #

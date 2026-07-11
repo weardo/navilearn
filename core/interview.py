@@ -91,7 +91,12 @@ Candidate's latest answer:
 Ask ONE adaptive follow-up question. It must build on the latest answer and stay
 grounded in the screen content, pushing for deeper technical detail (a trade-off,
 an edge case, a specific implementation choice, or a claim that needs evidence).
-If the answer was vague or wrong, zero in on that gap. Question only."""
+If the answer was vague or wrong, zero in on that gap.
+
+When the current screen text above is non-empty you can see the candidate's
+screen, so you MUST refer to something specific you actually see on it in your
+question (a named function, file, class, error, or piece of UI), making it clear
+you are looking at their real work right now. Question only."""
 
 _JUDGE_SYSTEM = (
     "You are a rigorous, fair technical-interview evaluator. You grade only on "

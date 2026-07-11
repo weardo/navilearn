@@ -387,11 +387,24 @@ def _render_study_notes(repo: Repository, user: Profile) -> None:
     st.caption("Your full library lives in **Study Studio**.")
 
 
+def _render_interview_link() -> None:
+    """Render the page link to the full, openable interviews page (best-effort)."""
+
+    try:
+        st.page_link(
+            "pages/Interviews.py", label="Open all interviews", icon="🎯"
+        )
+    except Exception:  # noqa: BLE001 - navigation is best-effort.
+        st.caption("Open **My Interviews** from the sidebar to see them all.")
+
+
 def _render_interviews(repo: Repository, user: Profile) -> None:
-    """Render the "My interviews" card: the student's recent scored reports.
+    """Render the "My interviews" card: a summary plus a link to the full page.
 
     Shows up to five recent AI-interview reports with an overall score and the
-    date. The empty state points at the AI Interview page.
+    date as a summary, then links to the openable **My Interviews** page where
+    each report expands to its full rubric breakdown and feedback. The empty
+    state points at the AI Interview page.
     """
 
     st.markdown("#### My interviews")
@@ -401,6 +414,7 @@ def _render_interviews(repo: Repository, user: Profile) -> None:
             "No interviews yet. Run a mock interview on one of your projects in "
             "**AI Interview** to get scored feedback here."
         )
+        _render_interview_link()
         return
     for report in reports:
         overall = _report_overall(report.scores)
@@ -408,7 +422,7 @@ def _render_interviews(repo: Repository, user: Profile) -> None:
         title = report.project_title or "Untitled project"
         st.markdown(f"**{title}** · {score}")
         st.caption(f"Scored {_fmt_date(report.created_at)}")
-    st.caption("Practice more in **AI Interview**.")
+    _render_interview_link()
 
 
 def _render_messages(user: Profile) -> None:
@@ -444,23 +458,63 @@ def _render_messages(user: Profile) -> None:
     st.caption("**Open Messages** in the sidebar to read and reply.")
 
 
-def _render_mentor_feedback(user: Profile) -> None:
-    """Render the two-way "Mentor conversation" card on the student side.
+def _render_shared_with_you(user: Profile) -> None:
+    """Render the "Shared with you" card: notes other users sent to this user.
 
-    Closes the mentoring loop as a real dialogue: the student sees the full
-    thread (mentor messages and their own replies, labelled by author) and can
-    reply back to their mentor inline. Messages are read via
-    :func:`core.mentoring.list_notes`, keyed by ``user.id`` (the same runtime id
-    the student carries), which the mentoring layer canonicalizes to match how a
-    mentor stored them; a reply is saved via :func:`core.mentoring.save_note`
-    with the ``student`` author role. The mentoring module is imported
-    defensively so a momentary import or backend failure logs and degrades to a
-    caption rather than crashing Home. Sending is best-effort.
+    Lists notes delivered directly to ``user.id`` via ``core.notes`` targeted
+    sharing (newest share first), each with its title, who shared it, and its
+    date. The notes module is imported defensively so a momentary import or
+    backend failure logs and degrades to a caption rather than crashing Home.
     """
 
-    st.markdown("#### Conversation with your mentor")
+    st.markdown("#### Shared with you")
     try:
-        from core.mentoring import list_notes, save_note
+        from core.notes import list_shared_with_me
+
+        shared = list_shared_with_me(user.id)
+    except Exception as exc:  # best-effort: never crash Home over shared notes
+        _LOG.warning("shared-with-you card unavailable: %s", exc)
+        st.caption("Shared notes are momentarily unavailable. Try again shortly.")
+        return
+
+    if not shared:
+        st.caption("Nothing shared with you yet.")
+        return
+
+    for note in shared:
+        title = (note.title or "").strip() or "Untitled note"
+        sharer = (note.shared_by or "").strip() or "someone"
+        st.markdown(f"**{title}**")
+        st.caption(f"from {sharer} · {_fmt_date(note.updated_at or note.created_at)}")
+
+
+def _render_mentor_link() -> None:
+    """Render the page link to the full mentor feedback page (best-effort)."""
+
+    try:
+        st.page_link(
+            "pages/Mentor_Feedback.py", label="Open mentor feedback", icon="🤝"
+        )
+    except Exception:  # noqa: BLE001 - navigation is best-effort.
+        st.caption("Open **Mentor Feedback** from the sidebar to read and reply.")
+
+
+def _render_mentor_feedback(user: Profile) -> None:
+    """Render the "Mentor feedback" card: a summary plus a link to the full page.
+
+    The full two-way conversation (and the reply box) now lives on the dedicated
+    **Mentor Feedback** page. This card is a compact summary: it shows the most
+    recent messages labelled by author, then links out to the full thread.
+    Messages are read via :func:`core.mentoring.list_notes`, keyed by ``user.id``
+    (the same runtime id the student carries), which the mentoring layer
+    canonicalizes to match how a mentor stored them. The mentoring module is
+    imported defensively so a momentary import or backend failure logs and
+    degrades to a caption rather than crashing Home.
+    """
+
+    st.markdown("#### Feedback from your mentor")
+    try:
+        from core.mentoring import list_notes
     except Exception as exc:  # best-effort: never crash Home over mentoring
         _LOG.warning("mentor feedback card unavailable: %s", exc)
         st.caption("Mentor feedback is momentarily unavailable. Try again shortly.")
@@ -478,41 +532,25 @@ def _render_mentor_feedback(user: Profile) -> None:
             "No mentor feedback yet. Once a mentor reviews your work, their "
             "notes will appear here and you can reply to them."
         )
-    else:
-        for note in notes:
-            role = (note.get("author_role") or "mentor").strip() or "mentor"
-            is_student = role == "student"
-            avatar = "🎓" if is_student else "🧑‍🏫"
-            chat_role = "user" if is_student else "assistant"
-            author = (note.get("author_name") or "").strip() or (
-                "You" if is_student else "Mentor"
-            )
-            text = (note.get("text") or "").strip()
-            with st.chat_message(chat_role, avatar=avatar):
-                if text:
-                    st.write(text)
-                st.caption(f"{author} · {_fmt_date(note.get('created_at', ''))}")
+        _render_mentor_link()
+        return
 
-    with st.form("mentor-reply-form", clear_on_submit=True):
-        reply_text = st.text_area(
-            "Reply to your mentor",
-            key="mentor-reply-text",
-            placeholder="Ask a question or share how it is going.",
-            height=80,
+    # Show only the most recent few messages as a preview; the full thread and
+    # the reply box live on the dedicated Mentor Feedback page.
+    for note in notes[-3:]:
+        role = (note.get("author_role") or "mentor").strip() or "mentor"
+        is_student = role == "student"
+        avatar = "🎓" if is_student else "🧑‍🏫"
+        chat_role = "user" if is_student else "assistant"
+        author = (note.get("author_name") or "").strip() or (
+            "You" if is_student else "Mentor"
         )
-        submitted = st.form_submit_button("Send reply")
-    if submitted:
-        author_name = (user.full_name or "").strip() or user.email or "Student"
-        try:
-            ok = save_note(user.id, user.id, author_name, reply_text, "student")
-        except Exception as exc:  # best-effort: never crash Home over mentoring
-            _LOG.warning("mentor reply failed: %s", exc)
-            ok = False
-        if ok:
-            st.success("Reply sent.")
-            st.rerun()
-        else:
-            st.warning("Could not send your reply. Enter some text and try again.")
+        text = (note.get("text") or "").strip()
+        with st.chat_message(chat_role, avatar=avatar):
+            if text:
+                st.write(text)
+            st.caption(f"{author} · {_fmt_date(note.get('created_at', ''))}")
+    _render_mentor_link()
 
 
 def _render_recommendation(repo: Repository, user: Profile) -> None:
@@ -573,6 +611,9 @@ def _render_student_dashboard(repo: Repository, user: Profile) -> None:
     with row3_right:
         with st.container(border=True):
             _render_progress_donut(repo, user)
+
+    with st.container(border=True):
+        _render_shared_with_you(user)
 
     with st.container(border=True):
         _render_mentor_feedback(user)
