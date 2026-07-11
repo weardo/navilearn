@@ -1,0 +1,19 @@
+services:
+  navi:
+    build: .
+    image: navilearn:latest
+    container_name: navilearn
+    env_file: /opt/navi/.env
+    environment:
+      # pyarrow segfaults unless this is set.
+      ARROW_DEFAULT_MEMORY_POOL: system
+    ports:
+      # cloudflared connects on localhost only.
+      - "127.0.0.1:8600:8600"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8600/_stcore/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3

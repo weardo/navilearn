@@ -81,12 +81,21 @@ class Course:
 
 @dataclass
 class Lesson:
-    """A single lesson within a course."""
+    """A single lesson within a course.
+
+    Beyond ordering, a lesson now carries real teaching material: ``content``
+    (markdown body shown in Learn), a ``module`` section name used to group a
+    course's lessons, and optional ``video_url`` / ``doc_url`` media links.
+    """
 
     id: str
     course_id: str
     title: str
     order_index: int = 0
+    content: str = ""
+    module: str = ""
+    video_url: str = ""
+    doc_url: str = ""
 
 
 @dataclass
@@ -114,13 +123,19 @@ class ActivityEvent:
 
 @dataclass
 class StudySet:
-    """A saved set of study artifacts produced from a source."""
+    """A saved set of study artifacts produced from a source.
+
+    ``content`` holds the full generated artifacts (summary, flashcards, concept
+    graph) as a plain dict so a saved set can be reopened after a refresh, not
+    just listed by title. Empty for legacy rows saved before content persistence.
+    """
 
     id: str
     owner_id: str
     title: str
     source: str = ""
     created_at: str = ""
+    content: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -149,7 +164,11 @@ class Repository(Protocol):
 
     # Courses and lessons.
     def list_courses(self) -> list[Course]: ...
+    def create_course(self, course: Course) -> Course: ...
     def list_lessons(self, course_id: str) -> list[Lesson]: ...
+    def get_lesson(self, lesson_id: str) -> Optional[Lesson]: ...
+    def create_lesson(self, lesson: Lesson) -> Lesson: ...
+    def backfill_lesson_content(self, repo: "Repository") -> int: ...
 
     # Activity.
     def record_activity(self, event: ActivityEvent) -> ActivityEvent: ...
@@ -168,6 +187,7 @@ class Repository(Protocol):
     # Study sets.
     def save_study_set(self, study_set: StudySet) -> StudySet: ...
     def list_study_sets(self, owner_id: str) -> list[StudySet]: ...
+    def get_study_set(self, set_id: str) -> Optional[StudySet]: ...
 
     # Interview reports.
     def save_interview_report(self, report: InterviewReport) -> InterviewReport: ...
@@ -183,7 +203,9 @@ class SqliteRepo:
     def __init__(self, sqlite_path: str, schema_path: str = _SCHEMA_PATH) -> None:
         self._path = sqlite_path
         self._schema_path = schema_path
-        self._conn = sqlite3.connect(sqlite_path)
+        # check_same_thread=False: Streamlit reruns each script on a pooled
+        # thread, so a session-cached connection is used across threads.
+        self._conn = sqlite3.connect(sqlite_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._ensure_schema()
@@ -192,6 +214,26 @@ class SqliteRepo:
         with open(self._schema_path, "r", encoding="utf-8") as handle:
             self._conn.executescript(handle.read())
         self._conn.commit()
+        # Best-effort migration for databases created before ``content`` existed.
+        # ``CREATE TABLE IF NOT EXISTS`` will not add the column to an old table.
+        try:
+            self._conn.execute(
+                "ALTER TABLE study_sets ADD COLUMN content TEXT NOT NULL DEFAULT '{}'"
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            # Column already present: nothing to do.
+            pass
+        # Best-effort migration for the richer ``lessons`` columns.
+        for _column in ("content", "module", "video_url", "doc_url"):
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE lessons ADD COLUMN {_column} TEXT NOT NULL DEFAULT ''"
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                # Column already present: nothing to do.
+                pass
 
     # -- Profiles -------------------------------------------------------- #
     def upsert_profile(self, profile: Profile) -> Profile:
@@ -240,20 +282,88 @@ class SqliteRepo:
         rows = self._conn.execute("SELECT * FROM courses ORDER BY title").fetchall()
         return [Course(id=r["id"], title=r["title"], description=r["description"]) for r in rows]
 
+    def create_course(self, course: Course) -> Course:
+        if not course.id:
+            course.id = _new_id()
+        self._conn.execute(
+            """
+            INSERT INTO courses (id, title, description) VALUES (?, ?, ?)
+            ON CONFLICT (id) DO UPDATE SET
+                title = excluded.title,
+                description = excluded.description
+            """,
+            (course.id, course.title, course.description),
+        )
+        self._conn.commit()
+        return course
+
+    @staticmethod
+    def _row_to_lesson(row: sqlite3.Row) -> Lesson:
+        keys = row.keys()
+        return Lesson(
+            id=row["id"],
+            course_id=row["course_id"],
+            title=row["title"] or "",
+            order_index=int(row["order_index"] or 0),
+            content=(row["content"] if "content" in keys else "") or "",
+            module=(row["module"] if "module" in keys else "") or "",
+            video_url=(row["video_url"] if "video_url" in keys else "") or "",
+            doc_url=(row["doc_url"] if "doc_url" in keys else "") or "",
+        )
+
     def list_lessons(self, course_id: str) -> list[Lesson]:
         rows = self._conn.execute(
             "SELECT * FROM lessons WHERE course_id = ? ORDER BY order_index",
             (course_id,),
         ).fetchall()
-        return [
-            Lesson(
-                id=r["id"],
-                course_id=r["course_id"],
-                title=r["title"],
-                order_index=r["order_index"],
-            )
-            for r in rows
-        ]
+        return [self._row_to_lesson(r) for r in rows]
+
+    def get_lesson(self, lesson_id: str) -> Optional[Lesson]:
+        row = self._conn.execute(
+            "SELECT * FROM lessons WHERE id = ?", (lesson_id,)
+        ).fetchone()
+        return self._row_to_lesson(row) if row is not None else None
+
+    def create_lesson(self, lesson: Lesson) -> Lesson:
+        if not lesson.id:
+            lesson.id = _new_id()
+        if not lesson.order_index:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(order_index), -1) AS m FROM lessons WHERE course_id = ?",
+                (lesson.course_id,),
+            ).fetchone()
+            # COALESCE guarantees a non-null value; do not use ``or`` here since a
+            # legitimate max of 0 is falsy and would collapse to -1.
+            lesson.order_index = int(row["m"]) + 1
+        self._conn.execute(
+            """
+            INSERT INTO lessons
+                (id, course_id, title, order_index, content, module, video_url, doc_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (id) DO UPDATE SET
+                title = excluded.title,
+                order_index = excluded.order_index,
+                content = excluded.content,
+                module = excluded.module,
+                video_url = excluded.video_url,
+                doc_url = excluded.doc_url
+            """,
+            (
+                lesson.id,
+                lesson.course_id,
+                lesson.title,
+                lesson.order_index,
+                lesson.content,
+                lesson.module,
+                lesson.video_url,
+                lesson.doc_url,
+            ),
+        )
+        self._conn.commit()
+        return lesson
+
+    def backfill_lesson_content(self, repo: "Repository") -> int:
+        return _backfill_lesson_content(repo)
 
     # -- Activity -------------------------------------------------------- #
     def record_activity(self, event: ActivityEvent) -> ActivityEvent:
@@ -388,38 +498,54 @@ class SqliteRepo:
             study_set.created_at = _now_iso()
         self._conn.execute(
             """
-            INSERT INTO study_sets (id, owner_id, title, source, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO study_sets (id, owner_id, title, source, content, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT (id) DO UPDATE SET
                 title = excluded.title,
-                source = excluded.source
+                source = excluded.source,
+                content = excluded.content
             """,
             (
                 study_set.id,
                 study_set.owner_id,
                 study_set.title,
                 study_set.source,
+                json.dumps(study_set.content or {}),
                 study_set.created_at,
             ),
         )
         self._conn.commit()
         return study_set
 
+    def _row_to_study_set(self, row: sqlite3.Row) -> StudySet:
+        """Map a ``study_sets`` row to a :class:`StudySet`, decoding content."""
+
+        try:
+            content = json.loads(row["content"]) if row["content"] else {}
+        except (ValueError, TypeError):
+            content = {}
+        return StudySet(
+            id=row["id"],
+            owner_id=row["owner_id"],
+            title=row["title"],
+            source=row["source"],
+            created_at=row["created_at"],
+            content=content if isinstance(content, dict) else {},
+        )
+
     def list_study_sets(self, owner_id: str) -> list[StudySet]:
         rows = self._conn.execute(
             "SELECT * FROM study_sets WHERE owner_id = ? ORDER BY created_at DESC",
             (owner_id,),
         ).fetchall()
-        return [
-            StudySet(
-                id=r["id"],
-                owner_id=r["owner_id"],
-                title=r["title"],
-                source=r["source"],
-                created_at=r["created_at"],
-            )
-            for r in rows
-        ]
+        return [self._row_to_study_set(r) for r in rows]
+
+    def get_study_set(self, set_id: str) -> Optional[StudySet]:
+        row = self._conn.execute(
+            "SELECT * FROM study_sets WHERE id = ?",
+            (set_id,),
+        ).fetchone()
+        return self._row_to_study_set(row) if row is not None else None
 
     # -- Interview reports ----------------------------------------------- #
     def save_interview_report(self, report: InterviewReport) -> InterviewReport:
@@ -522,23 +648,41 @@ class SupabaseRepo:
     def _table(self, name: str):
         return self._client.table(name)
 
+    @staticmethod
+    def _uid(value: Optional[str]) -> Optional[str]:
+        """Coerce an id/foreign-key to a valid UUID string.
+
+        Postgres id columns are ``uuid``, but callers (notably ``seed_demo``)
+        use readable string ids such as ``"student-demo"`` or
+        ``"course-python-l0"``. Values that already parse as UUIDs pass through
+        unchanged; anything else maps to a deterministic uuid5 so the same
+        string always yields the same UUID and foreign keys stay consistent.
+        """
+
+        if value is None:
+            return None
+        try:
+            return str(uuid.UUID(str(value)))
+        except (ValueError, AttributeError, TypeError):
+            return str(uuid.uuid5(uuid.NAMESPACE_URL, f"navilearn:{value}"))
+
     # -- Profiles -------------------------------------------------------- #
     def upsert_profile(self, profile: Profile) -> Profile:
         if not profile.id:
             profile.id = _new_id()
         self._table("profiles").upsert(
             {
-                "id": profile.id,
+                "id": self._uid(profile.id),
                 "email": profile.email,
                 "full_name": profile.full_name,
                 "role": profile.role,
-                "mentor_id": profile.mentor_id,
+                "mentor_id": self._uid(profile.mentor_id),
             }
         ).execute()
         return profile
 
     def get_profile(self, profile_id: str) -> Optional[Profile]:
-        res = self._table("profiles").select("*").eq("id", profile_id).limit(1).execute()
+        res = self._table("profiles").select("*").eq("id", self._uid(profile_id)).limit(1).execute()
         data = res.data or []
         return self._dict_to_profile(data[0]) if data else None
 
@@ -557,6 +701,31 @@ class SupabaseRepo:
             for d in (res.data or [])
         ]
 
+    def create_course(self, course: Course) -> Course:
+        if not course.id:
+            course.id = _new_id()
+        self._table("courses").upsert(
+            {
+                "id": self._uid(course.id),
+                "title": course.title,
+                "description": course.description,
+            }
+        ).execute()
+        return course
+
+    @staticmethod
+    def _dict_to_lesson(d: dict[str, Any]) -> Lesson:
+        return Lesson(
+            id=d["id"],
+            course_id=d["course_id"],
+            title=d.get("title", ""),
+            order_index=int(d.get("order_index", 0) or 0),
+            content=d.get("content") or "",
+            module=d.get("module") or "",
+            video_url=d.get("video_url") or "",
+            doc_url=d.get("doc_url") or "",
+        )
+
     def list_lessons(self, course_id: str) -> list[Lesson]:
         res = (
             self._table("lessons")
@@ -565,15 +734,50 @@ class SupabaseRepo:
             .order("order_index")
             .execute()
         )
-        return [
-            Lesson(
-                id=d["id"],
-                course_id=d["course_id"],
-                title=d.get("title", ""),
-                order_index=int(d.get("order_index", 0) or 0),
+        return [self._dict_to_lesson(d) for d in (res.data or [])]
+
+    def get_lesson(self, lesson_id: str) -> Optional[Lesson]:
+        res = (
+            self._table("lessons")
+            .select("*")
+            .eq("id", self._uid(lesson_id))
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return self._dict_to_lesson(rows[0]) if rows else None
+
+    def create_lesson(self, lesson: Lesson) -> Lesson:
+        if not lesson.id:
+            lesson.id = _new_id()
+        course_uid = self._uid(lesson.course_id)
+        if not lesson.order_index:
+            res = (
+                self._table("lessons")
+                .select("order_index")
+                .eq("course_id", course_uid)
+                .order("order_index", desc=True)
+                .limit(1)
+                .execute()
             )
-            for d in (res.data or [])
-        ]
+            rows = res.data or []
+            lesson.order_index = (int(rows[0]["order_index"] or 0) + 1) if rows else 0
+        self._table("lessons").upsert(
+            {
+                "id": self._uid(lesson.id),
+                "course_id": course_uid,
+                "title": lesson.title,
+                "order_index": lesson.order_index,
+                "content": lesson.content,
+                "module": lesson.module,
+                "video_url": lesson.video_url,
+                "doc_url": lesson.doc_url,
+            }
+        ).execute()
+        return lesson
+
+    def backfill_lesson_content(self, repo: "Repository") -> int:
+        return _backfill_lesson_content(repo)
 
     # -- Activity -------------------------------------------------------- #
     def record_activity(self, event: ActivityEvent) -> ActivityEvent:
@@ -583,8 +787,8 @@ class SupabaseRepo:
             event.created_at = _now_iso()
         self._table("activity_events").insert(
             {
-                "id": event.id,
-                "student_id": event.student_id,
+                "id": self._uid(event.id),
+                "student_id": self._uid(event.student_id),
                 "type": event.type,
                 "payload": event.payload,
                 "created_at": event.created_at,
@@ -598,7 +802,7 @@ class SupabaseRepo:
         query = (
             self._table("activity_events")
             .select("*")
-            .eq("student_id", student_id)
+            .eq("student_id", self._uid(student_id))
             .order("created_at")
         )
         if since:
@@ -612,9 +816,9 @@ class SupabaseRepo:
             row.id = _new_id()
         self._table("progress").upsert(
             {
-                "id": row.id,
-                "student_id": row.student_id,
-                "lesson_id": row.lesson_id,
+                "id": self._uid(row.id),
+                "student_id": self._uid(row.student_id),
+                "lesson_id": self._uid(row.lesson_id),
                 "status": row.status,
                 "time_spent_seconds": row.time_spent_seconds,
                 "completed_at": row.completed_at,
@@ -625,7 +829,7 @@ class SupabaseRepo:
 
     def list_progress(self, student_id: str) -> list[ProgressRow]:
         res = (
-            self._table("progress").select("*").eq("student_id", student_id).execute()
+            self._table("progress").select("*").eq("student_id", self._uid(student_id)).execute()
         )
         return [self._dict_to_progress(d) for d in (res.data or [])]
 
@@ -674,33 +878,49 @@ class SupabaseRepo:
             study_set.created_at = _now_iso()
         self._table("study_sets").upsert(
             {
-                "id": study_set.id,
-                "owner_id": study_set.owner_id,
+                "id": self._uid(study_set.id),
+                "owner_id": self._uid(study_set.owner_id),
                 "title": study_set.title,
                 "source": study_set.source,
+                "content": study_set.content or {},
                 "created_at": study_set.created_at,
             }
         ).execute()
         return study_set
 
+    def _dict_to_study_set(self, d: dict[str, Any]) -> StudySet:
+        """Map a Supabase ``study_sets`` row dict to a :class:`StudySet`."""
+
+        content = d.get("content") or {}
+        return StudySet(
+            id=d["id"],
+            owner_id=d["owner_id"],
+            title=d.get("title", ""),
+            source=d.get("source", ""),
+            created_at=d.get("created_at", ""),
+            content=content if isinstance(content, dict) else {},
+        )
+
     def list_study_sets(self, owner_id: str) -> list[StudySet]:
         res = (
             self._table("study_sets")
             .select("*")
-            .eq("owner_id", owner_id)
+            .eq("owner_id", self._uid(owner_id))
             .order("created_at", desc=True)
             .execute()
         )
-        return [
-            StudySet(
-                id=d["id"],
-                owner_id=d["owner_id"],
-                title=d.get("title", ""),
-                source=d.get("source", ""),
-                created_at=d.get("created_at", ""),
-            )
-            for d in (res.data or [])
-        ]
+        return [self._dict_to_study_set(d) for d in (res.data or [])]
+
+    def get_study_set(self, set_id: str) -> Optional[StudySet]:
+        res = (
+            self._table("study_sets")
+            .select("*")
+            .eq("id", self._uid(set_id))
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return self._dict_to_study_set(rows[0]) if rows else None
 
     # -- Interview reports ----------------------------------------------- #
     def save_interview_report(self, report: InterviewReport) -> InterviewReport:
@@ -710,8 +930,8 @@ class SupabaseRepo:
             report.created_at = _now_iso()
         self._table("interview_reports").insert(
             {
-                "id": report.id,
-                "student_id": report.student_id,
+                "id": self._uid(report.id),
+                "student_id": self._uid(report.student_id),
                 "project_title": report.project_title,
                 "scores": report.scores,
                 "feedback": report.feedback,
@@ -724,7 +944,7 @@ class SupabaseRepo:
         res = (
             self._table("interview_reports")
             .select("*")
-            .eq("student_id", student_id)
+            .eq("student_id", self._uid(student_id))
             .order("created_at", desc=True)
             .execute()
         )
@@ -795,10 +1015,128 @@ def get_repo(settings: Optional[Settings] = None) -> Repository:
         settings = get_settings()
     backend = (settings.db_backend or "sqlite").strip().lower()
     if backend == "supabase":
-        return SupabaseRepo(
-            settings.supabase_url, settings.supabase_service_role_key
-        )
+        # Prefer the service-role/secret key (bypasses RLS for server writes);
+        # fall back to the anon/publishable key when no secret key is set.
+        key = settings.supabase_service_role_key or settings.supabase_anon_key
+        return SupabaseRepo(settings.supabase_url, key)
     return SqliteRepo(settings.sqlite_path)
+
+
+# --------------------------------------------------------------------------- #
+# Lesson content helpers
+# --------------------------------------------------------------------------- #
+# A real, short Python intro video used so the Learn surface can render media.
+DEMO_VIDEO_URL = "https://www.youtube.com/watch?v=rfscVS0vtbw"
+
+
+def _module_for(order_index: int, total: int) -> str:
+    """Return a section name grouping a course's lessons into 1-2 modules.
+
+    The first half of a course (by ``order_index``) is "Fundamentals"; the
+    remainder is "Applied Practice". Single-lesson courses use one section.
+    """
+
+    if total <= 1:
+        return "Getting Started"
+    half = (total + 1) // 2
+    return "Fundamentals" if order_index < half else "Applied Practice"
+
+
+def _content_stub(course_title: str, lesson_title: str) -> str:
+    """Return a short markdown body derived from a lesson and its course."""
+
+    return (
+        f"# {lesson_title}\n\n"
+        f"Part of **{course_title}**.\n\n"
+        f"In this lesson you will explore {lesson_title.lower()} and how it fits "
+        f"into {course_title}. Work through the notes below, then mark the lesson "
+        f"complete when you are comfortable with the ideas.\n\n"
+        "## Key points\n\n"
+        f"- Understand what {lesson_title.lower()} means and why it matters.\n"
+        "- See a small, concrete example you can reproduce.\n"
+        "- Practice by adapting the example to your own case.\n\n"
+        "## Try it\n\n"
+        f"Write a few lines that apply {lesson_title.lower()} yourself, then "
+        "compare against the example above.\n"
+    )
+
+
+def _is_ml_course(course: Course) -> bool:
+    """Best-effort detection of the machine-learning demo course by title/id."""
+
+    text = f"{course.title} {course.id}".lower()
+    return "machine learning" in text or "-ml" in text or text.endswith(" ml")
+
+
+def _persist_lesson_update(
+    repo: Repository,
+    lesson: Lesson,
+    content: str,
+    module: str,
+    video_url: str,
+) -> None:
+    """Update a lesson's content/module/video in place without reordering.
+
+    ``create_lesson`` reassigns a zero ``order_index``; backfill must preserve
+    existing order, so it writes the mutable fields directly per backend.
+    """
+
+    if isinstance(repo, SqliteRepo):
+        repo._conn.execute(  # noqa: SLF001 - backend-aware maintenance helper
+            "UPDATE lessons SET content = ?, module = ?, video_url = ? WHERE id = ?",
+            (content, module, video_url, lesson.id),
+        )
+        repo._conn.commit()  # noqa: SLF001
+        return
+    if isinstance(repo, SupabaseRepo):
+        repo._table("lessons").update(  # noqa: SLF001
+            {"content": content, "module": module, "video_url": video_url}
+        ).eq("id", repo._uid(lesson.id)).execute()  # noqa: SLF001
+        return
+    raise TypeError(f"Cannot backfill lessons for repo type {type(repo).__name__}")
+
+
+def _backfill_lesson_content(repo: Repository) -> int:
+    """Give every content-less lesson a markdown stub, a module, and (ML) a video.
+
+    For each course, lessons with empty ``content`` receive a title-derived
+    markdown stub; lessons with empty ``module`` are grouped into 1-2 named
+    sections by ``order_index``; and the first lesson of the machine-learning
+    course gets the demo video when it has none. Returns the number of lessons
+    updated. Best-effort: a failure on one lesson is logged and skipped.
+    """
+
+    import logging
+
+    log = logging.getLogger(__name__)
+    updated = 0
+    for course in repo.list_courses():
+        lessons = repo.list_lessons(course.id)
+        total = len(lessons)
+        is_ml = _is_ml_course(course)
+        first_order = min((les.order_index for les in lessons), default=0)
+        for lesson in lessons:
+            content = lesson.content or ""
+            module = lesson.module or ""
+            video_url = lesson.video_url or ""
+            changed = False
+            if not content.strip():
+                content = _content_stub(course.title, lesson.title)
+                changed = True
+            if not module.strip():
+                module = _module_for(lesson.order_index, total)
+                changed = True
+            if is_ml and lesson.order_index == first_order and not video_url.strip():
+                video_url = DEMO_VIDEO_URL
+                changed = True
+            if not changed:
+                continue
+            try:
+                _persist_lesson_update(repo, lesson, content, module, video_url)
+                updated += 1
+            except Exception as exc:  # noqa: BLE001 - best-effort maintenance
+                log.warning("backfill_lesson_content skipped %s: %s", lesson.id, exc)
+    return updated
 
 
 # --------------------------------------------------------------------------- #
@@ -834,6 +1172,14 @@ def seed_demo(repo: Repository) -> dict[str, int]:
             mentor_id=mentor.id,
         )
     )
+    repo.upsert_profile(
+        Profile(
+            id="teacher-demo",
+            email="teacher@navilearn.dev",
+            full_name="Tara Teacher",
+            role="teacher",
+        )
+    )
 
     # Courses and lessons. Course ids fixed so re-seeding is idempotent.
     course_specs = [
@@ -865,10 +1211,26 @@ def seed_demo(repo: Repository) -> dict[str, int]:
     lessons_created = 0
     all_lessons: list[tuple[str, str]] = []  # (course_id, lesson_id)
     for course_id, title, desc, lesson_titles in course_specs:
+        # Build real lesson material: each lesson gets a grouping module and a
+        # short markdown body; the ML course's first lesson gets a demo video so
+        # the Learn surface renders an embedded player.
+        total = len(lesson_titles)
+        is_ml = "ml" in course_id.split("-")
+        lesson_specs: list[dict[str, str]] = []
+        for order, lesson_title in enumerate(lesson_titles):
+            lesson_specs.append(
+                {
+                    "title": lesson_title,
+                    "module": _module_for(order, total),
+                    "content": _content_stub(title, lesson_title),
+                    "video_url": DEMO_VIDEO_URL if (is_ml and order == 0) else "",
+                    "doc_url": "",
+                }
+            )
         # Seed a course row directly through SQLite when available; otherwise
         # rely on the migration having created reference data. For the demo we
         # write courses/lessons via the raw connection on SqliteRepo.
-        _seed_course(repo, course_id, title, desc, lesson_titles)
+        _seed_course(repo, course_id, title, desc, lesson_specs)
         for order, _lesson_title in enumerate(lesson_titles):
             lesson_id = f"{course_id}-l{order}"
             all_lessons.append((course_id, lesson_id))
@@ -964,13 +1326,14 @@ def _seed_course(
     course_id: str,
     title: str,
     description: str,
-    lesson_titles: list[str],
+    lesson_specs: list[dict[str, str]],
 ) -> None:
-    """Insert a course and its lessons.
+    """Insert a course and its lessons with real content, module, and media.
 
     Courses/lessons are reference data with no dedicated write method on the
     protocol, so we write them through the backend directly: raw SQL for
-    SQLite, table upserts for Supabase.
+    SQLite, table upserts for Supabase. Each entry in ``lesson_specs`` carries
+    ``title``, ``module``, ``content``, ``video_url``, and ``doc_url``.
     """
 
     if isinstance(repo, SqliteRepo):
@@ -983,31 +1346,51 @@ def _seed_course(
             """,
             (course_id, title, description),
         )
-        for order, lesson_title in enumerate(lesson_titles):
+        for order, spec in enumerate(lesson_specs):
             conn.execute(
                 """
-                INSERT INTO lessons (id, course_id, title, order_index)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT (id) DO UPDATE SET title = excluded.title,
-                                               order_index = excluded.order_index
+                INSERT INTO lessons
+                    (id, course_id, title, order_index,
+                     content, module, video_url, doc_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (id) DO UPDATE SET
+                    title = excluded.title,
+                    order_index = excluded.order_index,
+                    content = excluded.content,
+                    module = excluded.module,
+                    video_url = excluded.video_url,
+                    doc_url = excluded.doc_url
                 """,
-                (f"{course_id}-l{order}", course_id, lesson_title, order),
+                (
+                    f"{course_id}-l{order}",
+                    course_id,
+                    spec.get("title", ""),
+                    order,
+                    spec.get("content", ""),
+                    spec.get("module", ""),
+                    spec.get("video_url", ""),
+                    spec.get("doc_url", ""),
+                ),
             )
         conn.commit()
         return
 
     if isinstance(repo, SupabaseRepo):
         repo._table("courses").upsert(  # noqa: SLF001
-            {"id": course_id, "title": title, "description": description}
+            {"id": repo._uid(course_id), "title": title, "description": description}
         ).execute()
         rows = [
             {
-                "id": f"{course_id}-l{order}",
-                "course_id": course_id,
-                "title": lesson_title,
+                "id": repo._uid(f"{course_id}-l{order}"),
+                "course_id": repo._uid(course_id),
+                "title": spec.get("title", ""),
                 "order_index": order,
+                "content": spec.get("content", ""),
+                "module": spec.get("module", ""),
+                "video_url": spec.get("video_url", ""),
+                "doc_url": spec.get("doc_url", ""),
             }
-            for order, lesson_title in enumerate(lesson_titles)
+            for order, spec in enumerate(lesson_specs)
         ]
         repo._table("lessons").upsert(rows).execute()  # noqa: SLF001
         return

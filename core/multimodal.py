@@ -139,19 +139,26 @@ def analyze_text(
 
 
 def ocr_frames(image_paths: list[str], settings: Settings) -> str:
-    """Frames -> text extension hook for screen OCR (documented stub).
+    """Frames -> text: read each screen frame with the vision model, in order.
 
-    This is the interface the AI Interviewer fills in to read a candidate's
-    shared screen: a list of captured frame image paths is turned into text by
-    a vision model, which then flows into :func:`analyze_text` like any other
-    source. No OCR backend is wired here yet, so this returns an empty string
-    rather than raising, keeping the pipeline callable end to end.
+    This is the interface the AI Interviewer uses to read a candidate's shared
+    screen. Each captured frame image is described by
+    :func:`core.vision.describe_screen` (a Groq vision model), and the
+    per-frame descriptions are joined in frame order into one block of text
+    that then flows into :func:`analyze_text` like any other source.
 
-    To implement: send each frame to a vision-capable model (for example a
-    Groq or Sarvam multimodal endpoint) and concatenate the recognized text in
-    frame order. Deduplicate near-identical consecutive frames to save tokens.
+    Vision is best-effort: an unreadable or unreachable frame contributes an
+    empty description and is skipped, so the pipeline stays callable end to end
+    and a single bad frame never breaks a live capture loop.
     """
 
-    # NotImplemented-style no-op: the contract exists, the backend does not.
-    _ = (image_paths, settings)
-    return ""
+    from core.vision import describe_screen
+
+    settings = settings or get_settings()
+    parts: list[str] = []
+    for index, path in enumerate(image_paths):
+        description = describe_screen(path, settings)
+        if description.strip():
+            label = f"[Frame {index + 1}]" if len(image_paths) > 1 else ""
+            parts.append(f"{label}\n{description}".strip())
+    return "\n\n".join(parts)

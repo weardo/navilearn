@@ -11,10 +11,12 @@ from typing import Callable, Optional, Union
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 
-from core.config import get_settings
+from core.config import Settings, get_settings
 from core.embeddings import Embedder
 
 _COLLECTION = "navilearn"
+_SUPABASE_TABLE = "navilearn_chunks"
+_SUPABASE_RPC = "navilearn_match_chunks"
 
 TopicOf = Union[Callable[[str], str], str, None]
 
@@ -45,12 +47,15 @@ class TopicStore:
         embedder: Embedder,
         topic_of: TopicOf,
         source: str,
+        owner_id: str = "",
     ) -> int:
         """Embed and store chunks, tagging each with a source and topic.
 
         ``topic_of`` may be a fixed topic string, a callable mapping a chunk to
-        its topic, or ``None`` (topic defaults to "general"). Returns the number
-        of chunks added.
+        its topic, or ``None`` (topic defaults to "general"). ``owner_id`` is
+        stored in each chunk's metadata so per-owner search can filter to a
+        single learner's content; the default "" preserves existing callers.
+        Returns the number of chunks added.
         """
 
         if not chunks:
@@ -68,7 +73,9 @@ class TopicStore:
             else:
                 topic = "general"
             ids.append(f"{doc_id}:{index}")
-            metadatas.append({"source": source, "topic": topic})
+            metadatas.append(
+                {"source": source, "topic": topic, "owner_id": owner_id}
+            )
             documents.append(chunk)
 
         self._collection.add(
@@ -80,17 +87,30 @@ class TopicStore:
         return len(chunks)
 
     def search(
-        self, query: str, embedder: Embedder, top_k: int = 5
+        self,
+        query: str,
+        embedder: Embedder,
+        top_k: int = 5,
+        owner: str = "",
     ) -> list[dict]:
-        """Return the ``top_k`` most similar chunks with source and topic."""
+        """Return the ``top_k`` most similar chunks with source and topic.
+
+        When ``owner`` is non-empty the search is filtered to chunks whose
+        metadata ``owner_id`` matches, so a learner only searches their own
+        content. The default "" leaves the search unfiltered (backward
+        compatible).
+        """
 
         if self.count() == 0:
             return []
         query_vec = embedder.embed([query])[0]
-        result = self._collection.query(
-            query_embeddings=[query_vec],
-            n_results=min(top_k, self.count()),
-        )
+        query_kwargs: dict = {
+            "query_embeddings": [query_vec],
+            "n_results": min(top_k, self.count()),
+        }
+        if owner:
+            query_kwargs["where"] = {"owner_id": owner}
+        result = self._collection.query(**query_kwargs)
         return self._format(result)
 
     def search_by_topic(self, topic: str) -> list[dict]:
@@ -152,3 +172,146 @@ class TopicStore:
                 }
             )
         return out
+
+
+class SupabaseVectorStore:
+    """pgvector-backed store exposing the same interface as :class:`TopicStore`.
+
+    Chunks live in the ``chunks`` table (``content`` + ``embedding vector(384)``)
+    and similarity search runs through the ``match_chunks`` SQL function. Drop-in
+    for :class:`TopicStore` so the pipeline and search UI stay backend-agnostic.
+    """
+
+    def __init__(self, settings: Optional[Settings] = None) -> None:
+        from supabase import create_client  # local import: optional dependency
+
+        if settings is None:
+            settings = get_settings()
+        url = settings.supabase_url
+        key = settings.supabase_service_role_key or settings.supabase_anon_key
+        if not url or not key:
+            raise ValueError(
+                "SupabaseVectorStore needs supabase_url and a service or anon key"
+            )
+        self._client = create_client(url, key)
+
+    def _table(self):
+        return self._client.table("chunks")
+
+    def add_chunks(
+        self,
+        doc_id: str,
+        chunks: list[str],
+        embedder: Embedder,
+        topic_of: TopicOf,
+        source: str,
+        owner_id: str = "",
+    ) -> int:
+        """Embed and store chunks, tagging each with a source and topic.
+
+        ``owner_id`` is written into each row's ``owner_id`` column so per-owner
+        search can filter to a single learner's content; the default "" keeps
+        existing callers unchanged.
+        """
+
+        if not chunks:
+            return 0
+
+        embeddings = embedder.embed(chunks)
+        rows: list[dict] = []
+        for chunk, embedding in zip(chunks, embeddings):
+            if callable(topic_of):
+                topic = topic_of(chunk) or "general"
+            elif isinstance(topic_of, str):
+                topic = topic_of or "general"
+            else:
+                topic = "general"
+            rows.append(
+                {
+                    "source": source,
+                    "topic": topic,
+                    "content": chunk,
+                    "embedding": embedding,
+                    "owner_id": owner_id,
+                }
+            )
+        self._table().insert(rows).execute()
+        return len(chunks)
+
+    def search(
+        self,
+        query: str,
+        embedder: Embedder,
+        top_k: int = 5,
+        owner: str = "",
+    ) -> list[dict]:
+        """Return the ``top_k`` most similar chunks with source and topic.
+
+        When ``owner`` is non-empty it is forwarded to the ``match_chunks`` RPC,
+        which filters results to that owner; "" (the default) means unfiltered
+        and backward compatible.
+        """
+
+        query_vec = embedder.embed([query])[0]
+        res = self._client.rpc(
+            "match_chunks",
+            {
+                "query": query_vec,
+                "k": top_k,
+                "threshold": 0.0,
+                "owner": owner,
+            },
+        ).execute()
+        out: list[dict] = []
+        for row in res.data or []:
+            out.append(
+                {
+                    "text": row.get("content", ""),
+                    "source": row.get("source", ""),
+                    "topic": row.get("topic", ""),
+                    "score": _clamp(float(row.get("similarity", 0.0) or 0.0)),
+                }
+            )
+        return out
+
+    def search_by_topic(self, topic: str) -> list[dict]:
+        """Return all stored chunks whose topic matches ``topic``."""
+
+        res = (
+            self._table()
+            .select("content, source, topic")
+            .eq("topic", topic)
+            .execute()
+        )
+        out: list[dict] = []
+        for row in res.data or []:
+            out.append(
+                {
+                    "text": row.get("content", ""),
+                    "source": row.get("source", ""),
+                    "topic": row.get("topic", ""),
+                    "score": 1.0,
+                }
+            )
+        return out
+
+    def list_topics(self) -> list[str]:
+        """Return the sorted distinct set of topics in the store."""
+
+        res = self._table().select("topic").execute()
+        topics = {(row or {}).get("topic", "") for row in (res.data or [])}
+        topics.discard("")
+        return sorted(topics)
+
+    def count(self) -> int:
+        """Return the number of stored chunks."""
+
+        res = self._table().select("id", count="exact").execute()
+        return int(res.count or 0)
+
+    def reset(self) -> None:
+        """Delete all stored chunks (leaves the table in place)."""
+
+        self._table().delete().neq(
+            "id", "00000000-0000-0000-0000-000000000000"
+        ).execute()

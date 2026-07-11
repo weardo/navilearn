@@ -30,7 +30,11 @@ CREATE TABLE IF NOT EXISTS lessons (
     id          TEXT PRIMARY KEY,
     course_id   TEXT NOT NULL REFERENCES courses (id) ON DELETE CASCADE,
     title       TEXT NOT NULL DEFAULT '',
-    order_index INTEGER NOT NULL DEFAULT 0
+    order_index INTEGER NOT NULL DEFAULT 0,
+    content     TEXT NOT NULL DEFAULT '',  -- markdown lesson body
+    module      TEXT NOT NULL DEFAULT '',  -- section name grouping lessons
+    video_url   TEXT NOT NULL DEFAULT '',  -- optional embedded video
+    doc_url     TEXT NOT NULL DEFAULT ''   -- optional attached document
 );
 
 CREATE INDEX IF NOT EXISTS idx_lessons_course ON lessons (course_id, order_index);
@@ -63,6 +67,7 @@ CREATE TABLE IF NOT EXISTS study_sets (
     owner_id    TEXT NOT NULL REFERENCES profiles (id) ON DELETE CASCADE,
     title       TEXT NOT NULL DEFAULT '',
     source      TEXT NOT NULL DEFAULT '',
+    content     TEXT NOT NULL DEFAULT '{}',  -- JSON encoded as text
     created_at  TEXT NOT NULL
 );
 

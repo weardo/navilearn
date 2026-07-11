@@ -31,8 +31,12 @@ litellm.suppress_debug_info = True
 # an evaluation request and return a valid JSON verdict without any network.
 JUDGE_MARKER = "JUDGE_JSON"
 
-_TIMEOUT = 120.0
-_RETRIES = 2
+_TIMEOUT = 60.0
+# 0 retries on the primary: a rate-limit (429) means that model's per-minute
+# budget is spent, so retrying it (with backoff) only blocks the single Streamlit
+# thread. We instead fail over IMMEDIATELY to the next model in the fallback
+# chain, which has its own separate token bucket. Keeps the UI responsive.
+_RETRIES = 0
 
 
 @dataclass

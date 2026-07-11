@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 0; color: inherit; }
+    .wrap { display: flex; flex-direction: column; gap: 8px; }
+    button {
+      cursor: pointer; border: 0; border-radius: 8px; padding: 8px 14px;
+      font-size: 14px; font-weight: 600; background: #4f46e5; color: #fff;
+    }
+    button.stop { background: #6b7280; }
+    video { width: 100%; max-height: 220px; border-radius: 10px; background: #111; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: #9ca3af; }
+    .dot.live { background: #ef4444; }
+    .status { font-size: 13px; opacity: 0.85; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="row">
+      <button id="share">Share my screen</button>
+      <button id="stop" class="stop" style="display:none">Stop sharing</button>
+      <span class="dot" id="dot"></span>
+      <span class="status" id="status">Not sharing. Click to share your screen with the interviewer.</span>
+    </div>
+    <video id="v" autoplay muted playsinline></video>
+    <canvas id="c" style="display:none"></canvas>
+  </div>
+
+  <script>
+    // Minimal no-build Streamlit component: talks to the host via postMessage.
+    function _post(type, data) {
+      window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
+    }
+    function ready() { _post("streamlit:componentReady", { apiVersion: 1 }); }
+    function setHeight(h) { _post("streamlit:setFrameHeight", { height: h }); }
+    function setValue(v) { _post("streamlit:setComponentValue", { value: v, dataType: "json" }); }
+
+    var stream = null, timer = null, intervalMs = 5000;
+    var v = document.getElementById("v");
+    var c = document.getElementById("c");
+    var dot = document.getElementById("dot");
+    var statusEl = document.getElementById("status");
+    var shareBtn = document.getElementById("share");
+    var stopBtn = document.getElementById("stop");
+
+    function grab() {
+      if (!stream || !v.videoWidth) return;
+      // Downscale to keep the base64 payload small (max width ~900px).
+      var scale = Math.min(1, 900 / v.videoWidth);
+      c.width = Math.round(v.videoWidth * scale);
+      c.height = Math.round(v.videoHeight * scale);
+      c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+      try {
+        var url = c.toDataURL("image/jpeg", 0.6);
+        setValue(url);
+      } catch (e) {
+        setValue("ERROR:" + (e && e.message ? e.message : "capture failed"));
+      }
+    }
+
+    async function start() {
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 1 }, audio: false });
+        v.srcObject = stream;
+        dot.classList.add("live");
+        statusEl.textContent = "Sharing. The interviewer sees your screen.";
+        shareBtn.style.display = "none";
+        stopBtn.style.display = "inline-block";
+        // The user can end the share from the browser chrome too.
+        stream.getVideoTracks()[0].addEventListener("ended", stop);
+        if (timer) clearInterval(timer);
+        timer = setInterval(grab, intervalMs);
+        setTimeout(grab, 1200);
+      } catch (e) {
+        statusEl.textContent = "Screen share was declined or is unavailable.";
+        setValue("ERROR:" + (e && e.message ? e.message : "permission denied"));
+      }
+    }
+
+    function stop() {
+      if (timer) { clearInterval(timer); timer = null; }
+      if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+      v.srcObject = null;
+      dot.classList.remove("live");
+      statusEl.textContent = "Stopped sharing.";
+      shareBtn.style.display = "inline-block";
+      stopBtn.style.display = "none";
+    }
+
+    shareBtn.onclick = start;
+    stopBtn.onclick = stop;
+
+    // Streamlit sends a render event with args; read the capture interval if given.
+    window.addEventListener("message", function (e) {
+      if (e.data && e.data.type === "streamlit:render") {
+        var args = e.data.args || {};
+        if (args.interval_ms) intervalMs = args.interval_ms;
+        setHeight(280);
+      }
+    });
+
+    ready();
+    setHeight(280);
+  </script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+# NaviLearn Streamlit config. Tuned to run safely and cleanly behind
+# cloudflared at navi.soupup.ai.
+
+[server]
+headless = true
+port = 8600
+address = "0.0.0.0"
+enableCORS = false
+enableXsrfProtection = true
+enableWebsocketCompression = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# Hides the developer Deploy/Stop toolbar for end users.
+toolbarMode = "minimal"
+
+[theme]
+base = "light"
+primaryColor = "#2563eb"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f1f5f9"
+textColor = "#0f172a"

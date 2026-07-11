@@ -22,3 +22,18 @@ outputs/
 
 # Secrets and local config
 .env
+
+# Per-deployment HMAC secret for login cookies (never commit)
+.session_secret
+
+# Per-deployment API token signing secret (never commit)
+.api_secret
+
+# Runtime logs, local db, browser artifacts
+.serve_logs/
+*.log
+navilearn.db
+.playwright-mcp/
+
+# Large ONNX model binaries (Challenge 2 runs client-side; regenerable)
+models/

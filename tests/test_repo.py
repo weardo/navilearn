@@ -27,7 +27,11 @@ def repo(tmp_path) -> SqliteRepo:
 
 
 def test_get_repo_defaults_to_sqlite(tmp_path):
-    settings = Settings(sqlite_path=os.path.join(str(tmp_path), "factory.db"))
+    # Isolate from the deployment .env (which may set DB_BACKEND=supabase) so
+    # this exercises the code default, keeping the test hermetic and offline.
+    settings = Settings(
+        _env_file=None, sqlite_path=os.path.join(str(tmp_path), "factory.db")
+    )
     made = get_repo(settings)
     assert isinstance(made, SqliteRepo)
 

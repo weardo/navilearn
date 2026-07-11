@@ -1,0 +1,17 @@
+.venv
+.env
+.env.*
+.git
+.gitignore
+.chroma
+__pycache__
+*.pyc
+.serve_logs
+scratchpad
+.api_secret
+.session_secret
+.playwright-mcp
+.pytest_cache
+tests
+docs
+navilearn.egg-info
