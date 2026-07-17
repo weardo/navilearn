@@ -16,5 +16,4 @@ jobs:
       port: "8600"
       extra_env: ARROW_DEFAULT_MEMORY_POOL=system
       healthcheck_path: /_stcore/health
-      health_sleep: 8
     secrets: inherit
