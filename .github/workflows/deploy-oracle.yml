@@ -1,43 +1,20 @@
 name: Deploy to Oracle
+
+# Thin caller: deploy logic lives once in weardo/infra (reusable workflow).
 on:
   push:
     branches: [main]
     paths-ignore: ["**.md", "docs/**"]
   workflow_dispatch:
-concurrency:
-  group: deploy-navilearn
-  cancel-in-progress: true
+
 jobs:
   deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up SSH
-        env:
-          DEPLOY_KEY: ${{ secrets.ORACLE_DEPLOY_KEY }}
-          HOST: ${{ secrets.ORACLE_HOST }}
-        run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
-          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
-      - name: Sync + build + restart on oracle-a
-        env:
-          HOST: ${{ secrets.ORACLE_HOST }}
-        run: |
-          rsync -az -e "ssh -i ~/.ssh/deploy" \
-            --exclude .git --exclude node_modules --exclude data --exclude .env \
-            --exclude __pycache__ --exclude '*.egg-info' --exclude .venv \
-            ./ "ubuntu@$HOST:/opt/navilearn/"
-          ssh -i ~/.ssh/deploy "ubuntu@$HOST" bash -euo pipefail <<'REMOTE'
-            export PATH="$HOME/.local/bin:$PATH"
-            cd /opt/navilearn
-            sops -d secrets.enc.env > .env && chmod 600 .env
-            docker build -t navilearn:latest .
-            docker rm -f navilearn 2>/dev/null || true
-            docker run -d --name navilearn --network edge -p 127.0.0.1:8600:8600 \
-              --env-file .env -e ARROW_DEFAULT_MEMORY_POOL=system \
-              --restart unless-stopped navilearn:latest
-            sleep 8
-            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8600/_stcore/health || echo 000)
-            echo "navilearn health: HTTP $code"; [ "$code" = "200" ]
-          REMOTE
+    uses: weardo/infra/.github/workflows/deploy-oracle.yml@main
+    with:
+      app: navilearn
+      deploy_path: /opt/navilearn
+      port: "8600"
+      extra_env: ARROW_DEFAULT_MEMORY_POOL=system
+      healthcheck_path: /_stcore/health
+      health_sleep: 8
+    secrets: inherit
