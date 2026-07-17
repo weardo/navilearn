@@ -1,12 +1,9 @@
 name: Deploy to Oracle
-
-# Thin caller: deploy logic lives once in weardo/infra (reusable workflow).
 on:
   push:
     branches: [main]
     paths-ignore: ["**.md", "docs/**"]
   workflow_dispatch:
-
 jobs:
   deploy:
     uses: weardo/infra/.github/workflows/deploy-oracle.yml@main
@@ -14,6 +11,5 @@ jobs:
       app: navilearn
       deploy_path: /opt/navilearn
       port: "8600"
-      extra_env: ARROW_DEFAULT_MEMORY_POOL=system
-      healthcheck_path: /_stcore/health
+      healthcheck_path: /
     secrets: inherit
